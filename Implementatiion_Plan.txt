@@ -1,0 +1,1385 @@
+Amazon ML Challenge 2026
+Detailed Step-by-Step Implementation Plan
+Final architecture
+                         TRAIN DATA
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │   DATA LOADING  │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │       EDA       │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ PREPROCESSING   │
+                    │ Name + Address  │
+                    └────────┬────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              ▼              ▼              ▼
+         Name Blocks    Address Blocks   Combined Blocks
+              │              │              │
+              └──────────────┼──────────────┘
+                             ▼
+                    ┌─────────────────┐
+                    │ CANDIDATE UNION │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    candidate_pairs.tsv
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ PAIR FEATURES   │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ MATCHING MODEL  │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    Match probabilities
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ THRESHOLDING    │
+                    │ + SINGLETONS    │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    matching_results.tsv
+                             │
+                             ▼
+                    Official validator
+
+The challenge materials describe this exact two-stage architecture: blocking narrows the enormous comparison space, then the matching model scores candidates and retains true matches.
+
+PHASE 0: Set up the submission project
+
+The final ZIP should follow the prescribed structure:
+
+<team_name>_submission.zip
+│
+├── output/
+│   ├── matching_results.tsv
+│   └── candidate_pairs.tsv
+│
+├── code/
+│   └── business_entity_resolution/
+│       ├── src/
+│       │   ├── config.py
+│       │   ├── data_loader.py
+│       │   ├── preprocessing.py
+│       │   ├── blocking.py
+│       │   ├── features.py
+│       │   ├── train.py
+│       │   ├── evaluate.py
+│       │   ├── inference.py
+│       │   └── generate_submission.py
+│       │
+│       ├── README.md
+│       └── requirements.txt
+│
+└── Documentation_template.md
+
+The official submission specification requires the outputs, runnable source code, README, requirements, and methodology document.
+
+Goal of this phase
+
+Don't create a giant notebook and later try to turn it into a project.
+
+Build the final architecture from the beginning.
+
+PHASE 1: Load the datasets
+
+Create:
+
+src/data_loader.py
+
+Load:
+
+dataset/train/
+    train_source1.tsv
+    train_source2.tsv
+    train_source3.tsv
+    train_ground_truth.tsv
+
+dataset/test/
+    test_source1.tsv
+    test_source2.tsv
+    test_source3.tsv
+
+Use:
+
+pd.read_csv(path, sep="\t")
+
+The challenge explicitly says all files are TSV and must be read using an explicit tab separator.
+
+Validate immediately
+
+Check:
+
+columns
+row count
+duplicate entity IDs
+nulls
+data types
+country values
+
+Expected record columns:
+
+entity_id
+business_name
+business_address
+country
+
+The source is identifiable from the S1/S2/S3 ID prefix and file.
+
+PHASE 2: Understand the training data
+
+Before doing ML, understand what we're dealing with.
+
+2.1 Source statistics
+
+For each source calculate:
+
+number of records
+number of unique businesses
+missing names
+missing addresses
+missing countries
+duplicate names
+duplicate addresses
+2.2 Country distribution
+
+Calculate:
+
+Source 1:
+US → ?
+India → ?
+
+Source 2:
+...
+
+Source 3:
+...
+
+Do not hard-code the countries.
+
+The official instructions specifically warn that training has US and India while the test additionally contains France. Country must therefore be treated as an open-set string field.
+
+2.3 Name analysis
+
+Inspect:
+
+name length
+number of words
+percentage containing punctuation
+percentage containing legal suffixes
+duplicate names
+very short names
+
+Examples:
+
+Acme Robotics Inc.
+Acme Robotics Incorporated
+Acme Robotics
+Acme Robotix
+2.4 Address analysis
+
+Inspect:
+
+address length
+number of tokens
+numeric components
+ZIP/PIN-like patterns
+common abbreviations
+missing addresses
+
+The challenge specifically expects address abbreviations, missing components, landmarks, transliteration and component reordering.
+
+PHASE 3: Parse the ground truth
+
+The ground truth has:
+
+source1_entity_id
+matched_entity_ids
+
+For example:
+
+S1-001    S2-101,S3-501
+S1-002    S2-102
+S1-003
+
+The empty list means the S1 entity is a singleton.
+
+Convert it internally into pair-level labels:
+
+S1-001 → S2-101 → 1
+S1-001 → S3-501 → 1
+S1-002 → S2-102 → 1
+
+This becomes the foundation of training.
+
+PHASE 4: Build the validation framework FIRST
+
+This is essential.
+
+We don't want to make a model and discover after submitting that our local evaluation is wrong.
+
+4.1 Split by Source 1 entity
+
+For example:
+
+80% S1 → training
+20% S1 → validation
+
+The split should be at the S1 level rather than randomly splitting pair rows.
+
+4.2 Implement competition metric
+
+Create:
+
+src/evaluate.py
+
+Implement:
+
+$$ F_{0.5} = \frac{1.25PR} {0.25P+R} $$
+
+But importantly, this is a macro F₀.₅ across Source 1 entities, not simply one global pair-level F₀.₅.
+
+For every S1:
+
+true matches
+predicted matches
+precision
+recall
+F0.5
+
+Then:
+
+macro_F0.5 = mean(F0.5 across S1)
+PHASE 5: Explicit singleton evaluation
+
+A singleton is:
+
+S1 → no S2/S3 match
+
+Correct prediction:
+
+[]
+
+gets:
+
+F0.5 = 1
+
+Incorrect prediction:
+
+[S2-something]
+
+gets:
+
+F0.5 = 0
+
+The official challenge explicitly emphasizes this behavior.
+
+Therefore our evaluator should separately report:
+
+singleton_count
+correct_singletons
+singleton_accuracy
+false_singleton_merges
+PHASE 6: Build the preprocessing pipeline
+
+Create:
+
+src/preprocessing.py
+
+We should maintain multiple representations.
+
+For names:
+
+business_name_raw
+business_name_normalized
+business_name_alphanumeric
+business_name_tokens
+business_name_sorted_tokens
+business_name_without_legal_suffix
+
+For addresses:
+
+business_address_raw
+business_address_normalized
+business_address_alphanumeric
+business_address_tokens
+address_numbers
+
+Don't overwrite the raw values.
+
+PHASE 7: Business-name normalization
+
+Normalize things like:
+
+uppercase → lowercase
+punctuation
+extra spaces
+ampersand / and
+
+Handle legal suffix variations such as:
+
+Inc
+Incorporated
+Corp
+Corporation
+Ltd
+Limited
+Pvt
+Private
+LLC
+
+But preserve both:
+
+raw name
+cleaned name
+
+because aggressive cleaning can remove useful information.
+
+The official noise patterns specifically mention abbreviations, legal suffixes, punctuation, word order and typos.
+
+PHASE 8: Address normalization
+
+Create normalized versions of addresses.
+
+Handle obvious formatting differences:
+
+street → st
+road → rd
+avenue → ave
+
+Extract:
+
+house/building number
+numeric tokens
+PIN/ZIP-like numbers
+tokens
+
+For example:
+
+500 Market Street, San Jose
+
+could yield:
+
+normalized:
+500 market st san jose
+
+numbers:
+500
+
+tokens:
+500
+market
+st
+san
+jose
+
+Again, retain the original.
+
+PHASE 9: Do not use external information
+
+Everything must come from:
+
+training data
+test data
+provided files
+
+Do not use:
+
+Google
+Google Maps
+OpenStreetMap
+business directories
+government databases
+geocoding APIs
+commercial entity APIs
+internet business information
+
+The challenge explicitly prohibits external lookup, databases, APIs and geocoding.
+
+PHASE 10: Build blocking
+
+This is the first major ML component.
+
+Create:
+
+src/blocking.py
+
+The challenge says blocking uses a cheap key involving name and address, with records entering the same block through similar names or shared addresses.
+
+The Acme example is especially important.
+
+For:
+
+S1:
+Acme Robotics Inc.
+500 Market St, San Jose
+
+the candidate block contains:
+
+S2-118820
+Acme Robotics Inc.
+500 Market Street, San Jose
+
+S2-540221
+Acme Robotix
+12 Elm Rd, San Jose
+
+S3-905477
+Acme Robotics
+Nr City Hall, San Jose
+
+S3-063118
+Acme Bakery
+500 Market St, San Jose
+
+The first and third are likely true matches.
+
+The second and fourth are look-alikes.
+
+All four enter blocking.
+
+The matching model later removes the two false candidates.
+
+PHASE 11: Implement multiple blocking keys
+
+Don't rely on a single blocking rule.
+
+Block A: Exact normalized name
+name_normalized
+
+Example:
+
+acme robotics inc
+Block B: Name without legal suffix
+name_without_suffix
+
+So:
+
+Acme Robotics Inc.
+Acme Robotics Incorporated
+
+can enter the same block.
+
+Block C: Name tokens
+
+Use informative tokens from:
+
+Acme Robotics
+
+such as:
+
+acme
+robotics
+Block D: Name prefix / character key
+
+For typo robustness:
+
+name_normalized[:4]
+name_normalized[:5]
+
+or character n-gram keys.
+
+Block E: Address tokens
+
+For:
+
+500 Market Street San Jose
+
+use tokens such as:
+
+500
+market
+san
+jose
+Block F: Numeric address key
+
+Use:
+
+house_number
+
+and other useful numeric components.
+
+This allows the S3 "Acme Bakery" look-alike in the official example to enter the Acme candidate set because the address is shared.
+
+Block G: Name + address key
+
+Construct a combined cheap key such as:
+
+name_prefix + address_token
+
+This is closer to the blocking concept explicitly shown in the PPT.
+
+PHASE 12: Union the blocking strategies
+
+This is extremely important.
+
+We should do:
+
+name_candidates
+        UNION
+address_candidates
+        UNION
+name_address_candidates
+        UNION
+token_candidates
+        UNION
+numeric_candidates
+
+rather than requiring every condition simultaneously.
+
+Conceptually:
+
+                   S1
+                    │
+       ┌────────────┼────────────┐
+       ▼            ▼            ▼
+     NAME        ADDRESS      COMBINED
+     BLOCK        BLOCK         BLOCK
+       │            │            │
+       └────────────┼────────────┘
+                    ▼
+                  UNION
+                    │
+                    ▼
+             Candidate pairs
+
+Why?
+
+Because blocking is supposed to favor recall. Amazon explicitly says that the block intentionally pulls in look-alikes.
+
+PHASE 13: Measure blocking recall
+
+This is the most important blocking metric.
+
+For validation:
+
+Total true pairs
+
+versus:
+
+True pairs present in candidate set
+
+Calculate:
+
+$$ BlockingRecall = \frac{\text{True pairs inside candidate set}} {\text{Total true pairs}} $$
+
+For example:
+
+10,000 true matches
+9,850 retrieved by blocking
+
+Blocking recall = 98.5%
+Rule:
+
+If blocking recall is poor:
+
+DO NOT improve the matching model yet.
+
+Fix blocking first.
+
+Amazon explicitly says blocking sets the recall ceiling.
+
+PHASE 14: Control candidate explosion
+
+There is a trade-off.
+
+If a token like:
+
+"the"
+
+appears in 100,000 records, using it as a block produces a disaster.
+
+Therefore:
+
+if block_size > MAX_BLOCK_SIZE:
+    don't use that key
+
+or use more specific keys.
+
+For example:
+
+bad:
+common_token
+
+better:
+common_token + address_token
+
+We want:
+
+HIGH BLOCKING RECALL
++
+LOW CANDIDATE VOLUME
+PHASE 15: Generate training candidate pairs
+
+After blocking:
+
+S1
+ ↓
+candidate S2/S3 records
+
+construct:
+
+s1_id
+candidate_id
+label
+
+Example:
+
+S1-001 S2-100 1
+S1-001 S2-101 0
+S1-001 S3-200 1
+S1-001 S3-201 0
+
+Positive pairs come from ground truth.
+
+Candidate pairs not in ground truth become negatives.
+
+PHASE 16: Generate hard negatives
+
+This is important.
+
+The Acme example tells us what kind of negatives we want:
+
+Type 1
+very similar name
+different address
+Type 2
+same address
+different business
+Type 3
+similar name + similar location
+but different business
+
+These are much more informative than random negatives.
+
+The blocking stage naturally generates many of these hard negatives.
+
+PHASE 17: Pairwise feature engineering
+
+Create:
+
+src/features.py
+
+For every candidate pair:
+
+S1 record
++
+S2/S3 record
+
+generate features.
+
+PHASE 18: Name features
+
+Use:
+
+Exact match
+name_exact
+Normalized exact match
+name_normalized_exact
+Levenshtein similarity
+name_levenshtein
+Jaro-Winkler
+name_jaro
+Token Jaccard
+$$ J(A,B)=\frac{|A\cap B|} {|A\cup B|} $$
+Token overlap
+intersection / min(token_count_A, token_count_B)
+TF-IDF cosine
+
+Use character and/or word n-grams.
+
+The official challenge itself recommends Jaccard, Levenshtein and TF-IDF cosine similarity.
+
+PHASE 19: Address features
+
+Calculate:
+
+address_levenshtein
+address_jaro
+address_jaccard
+address_tfidf_cosine
+
+Plus:
+
+numeric_token_overlap
+house_number_match
+zip_match
+shared_token_count
+PHASE 20: Cross features
+
+Add:
+
+country_match
+name_address_joint_score
+name_token_overlap
+address_token_overlap
+
+For example:
+
+name_similarity = 0.95
+address_similarity = 0.92
+country_match = 1
+
+should be very strong.
+
+While:
+
+name_similarity = 0.95
+address_similarity = 0.08
+
+should be treated differently.
+
+PHASE 21: Source-pair features
+
+Add:
+
+source_pair = S1-S2
+
+versus:
+
+source_pair = S1-S3
+
+because the two vendor sources may have different formatting conventions.
+
+The challenge describes Sources 2 and 3 as different vendor representations.
+
+PHASE 22: First matching model
+
+Now train the actual matching classifier.
+
+Input:
+
+candidate pair
+        ↓
+engineered features
+
+Output:
+
+P(same_business)
+
+Start with a gradient-boosted tree model such as:
+
+LightGBM
+
+or another appropriately licensed tabular model.
+
+Do not start with an 8B LLM.
+
+The challenge is fundamentally a structured pairwise matching problem, and the official material does not require an LLM. The model-license constraint also applies to the final model.
+
+PHASE 23: Train the model
+
+Training data:
+
+candidate pair
+        │
+        ▼
+features
+        │
+        ▼
+label
+0 / 1
+
+Train:
+
+LightGBM
+
+and save:
+
+models/matcher.pkl
+
+or the appropriate model file.
+
+PHASE 24: Evaluate pair classifier
+
+Initially calculate:
+
+ROC-AUC
+PR-AUC
+precision
+recall
+
+But remember:
+
+These are NOT our final competition objective.
+
+The actual objective is:
+
+macro F0.5 at the S1 level
+
+So ultimately the threshold must be selected using the competition evaluator.
+
+PHASE 25: Threshold optimization
+
+Suppose the model generates:
+
+S1-A ↔ S2-X → 0.997
+S1-A ↔ S2-Y → 0.812
+S1-A ↔ S3-Z → 0.976
+S1-A ↔ S3-Q → 0.214
+
+Don't automatically use:
+
+threshold = 0.5
+
+Test:
+
+0.50
+0.55
+0.60
+...
+0.90
+0.92
+0.94
+0.96
+0.98
+
+For each:
+
+Generate complete S1 predictions
+        ↓
+Calculate macro F0.5
+
+Choose the threshold giving the best validation F₀.₅.
+
+PHASE 26: Consider separate S2/S3 thresholds
+
+After the baseline, test:
+
+threshold_S2
+threshold_S3
+
+because the two sources may have different noise patterns.
+
+But this is an experiment, not something we should assume beforehand.
+
+Only keep it if validation improves.
+
+PHASE 27: Multiple matches
+
+For every S1:
+
+matches = [
+    candidate
+    for candidate in candidates
+    if probability >= threshold
+]
+
+Do not select only the highest-scoring candidate.
+
+The challenge explicitly allows:
+
+zero matches
+one match
+many matches
+
+for a Source 1 entity.
+
+PHASE 28: Singleton handling
+
+For every S1 calculate:
+
+maximum candidate probability
+second-highest probability
+number of candidates above threshold
+
+If none pass the final threshold:
+
+matched_entity_ids = ""
+
+This is a legitimate prediction, not a failure.
+
+Correctly identifying a singleton earns full per-entity score.
+
+PHASE 29: Error analysis
+
+After the first model, don't immediately try another model.
+
+Inspect:
+
+False positives
+
+Examples:
+
+same name
+different address
+
+same address
+different name
+
+similar name
+similar address
+but different entity
+False negatives
+
+Examples:
+
+heavy typo
+partial address
+landmark address
+word reordering
+abbreviation
+transliteration
+
+Then modify:
+
+blocking
+features
+normalization
+threshold
+
+based on observed errors.
+
+PHASE 30: Final blocking pipeline
+
+Once we have the best blocking configuration, run it on the test set.
+
+For every:
+
+test_source1
+
+generate candidates from:
+
+test_source2
+test_source3
+
+Then save:
+
+output/candidate_pairs.tsv
+
+The file should contain the final candidate set that is actually fed into the matching model.
+
+PHASE 31: Final inference
+
+Pipeline:
+
+test S1
+   ↓
+preprocessing
+   ↓
+blocking
+   ↓
+candidate pairs
+   ↓
+feature generation
+   ↓
+trained matcher
+   ↓
+probabilities
+   ↓
+threshold
+   ↓
+matches
+PHASE 32: Generate matching_results.tsv
+
+Final structure:
+
+source1_entity_id    matched_entity_ids
+
+Example:
+
+S1-732914    S2-118820,S3-905477
+S1-889301    S2-397155,S3-651230
+S1-410562    S2-663049
+S1-205774
+
+Every S1 must have exactly one row.
+
+Empty means no matches.
+
+No duplicate IDs.
+
+Only S2/S3 IDs.
+
+The official specification is strict about these requirements.
+
+PHASE 33: Check candidate-subset consistency
+
+For every final match:
+
+matched ID ∈ candidate IDs
+
+For example:
+
+candidate:
+S1-001 → S2-A,S2-B,S3-C
+
+then final can be:
+
+S1-001 → S2-A,S3-C
+
+but never:
+
+S1-001 → S2-X
+
+because S2-X was never evaluated by the model.
+
+The challenge explicitly requires final matches to be a subset of the candidate set.
+
+PHASE 34: Run official validator
+
+Before every submission:
+
+python3 utils/validate_submission.py \
+    --matching output/matching_results.tsv \
+    --candidate output/candidate_pairs.tsv \
+    --test-dir dataset/test
+
+This checks the structural requirements.
+
+PHASE 35: Submit matching_results.tsv
+
+During the challenge:
+
+Portal
+  ↓
+matching_results.tsv
+
+This is the only file used for leaderboard scoring.
+
+PHASE 36: Maintain experiment history
+
+Since there are only 5 submissions per day, don't randomly burn submissions.
+
+Create:
+
+experiments.csv
+
+with:
+
+Exp	Blocking	Features	Model	Threshold	Local F₀.₅	Public Score	Notes
+1	baseline	basic	LightGBM	.90	...	...	baseline
+2	+address	basic	LightGBM	.90	...	...	...
+3	+char block	full	LightGBM	.92	...	...	...
+
+This prevents us from wandering around the forest with a compass made of spaghetti.
+
+PHASE 37: Submission experiments
+
+A sensible progression:
+
+Submission 1
+
+Basic:
+
+normalization
++
+name/address blocking
++
+similarity features
++
+simple matcher
+
+Purpose: establish baseline.
+
+Submission 2
+
+Improve blocking recall.
+
+Submission 3
+
+Improve pairwise model/features.
+
+Submission 4
+
+Optimize F₀.₅ threshold/singletons.
+
+Submission 5
+
+Best locally validated configuration.
+
+Then use the next day for targeted improvements.
+
+PHASE 38: Build the final README
+
+The README should explain:
+
+1. Environment setup
+2. Dataset location
+3. Training command
+4. Inference command
+5. Output generation
+6. Validation command
+
+For example:
+
+pip install -r requirements.txt
+
+python src/train.py
+
+python src/inference.py
+
+python src/generate_submission.py
+
+The official submission requires a self-contained reproducible pipeline.
+
+PHASE 39: requirements.txt
+
+Pin the exact versions used.
+
+For example:
+
+pandas==...
+numpy==...
+scikit-learn==...
+lightgbm==...
+rapidfuzz==...
+scipy==...
+joblib==...
+
+Only include libraries actually used.
+
+PHASE 40: Documentation
+
+Fill:
+
+Documentation_template.md
+
+with:
+
+1. Methodology
+
+Explain the entire pipeline.
+
+2. Candidate generation / blocking
+
+Explain:
+
+name blocks
+address blocks
+combined blocks
+union
+candidate recall
+3. Model architecture
+
+Explain:
+
+pair construction
+features
+classifier
+threshold
+singleton handling
+4. Experiments
+
+Document:
+
+baseline
+blocking improvements
+feature improvements
+model experiments
+threshold experiments
+5. Final results
+
+Include:
+
+validation F0.5
+blocking recall
+model configuration
+final submission score
+
+The official guidelines specifically ask for methodology, blocking strategy, model architecture/feature engineering and relevant approach details.
+
+The most important design decision
+
+I want us to maintain this distinction throughout the project:
+
+Blocking
+Question:
+
+"Should this pair be considered?"
+
+Goal:
+
+High recall
+
+Accept:
+
+true matches
++
+look-alikes
++
+some garbage
+Matching model
+Question:
+
+"Are these actually the same business?"
+
+Goal:
+
+High precision
+
+Reject:
+
+similar name / wrong address
+shared address / wrong business
+Final implementation roadmap
+STEP 01
+Create project structure
+        ↓
+STEP 02
+Load TSVs
+        ↓
+STEP 03
+EDA
+        ↓
+STEP 04
+Parse ground truth
+        ↓
+STEP 05
+Build S1-level validation split
+        ↓
+STEP 06
+Implement macro F0.5 evaluator
+        ↓
+STEP 07
+Implement name normalization
+        ↓
+STEP 08
+Implement address normalization
+        ↓
+STEP 09
+Build name blocking
+        ↓
+STEP 10
+Build address blocking
+        ↓
+STEP 11
+Build combined blocking
+        ↓
+STEP 12
+Union candidate sets
+        ↓
+STEP 13
+Measure blocking recall
+        ↓
+STEP 14
+Generate positive/negative pairs
+        ↓
+STEP 15
+Generate hard negatives
+        ↓
+STEP 16
+Build pairwise features
+        ↓
+STEP 17
+Train matching model
+        ↓
+STEP 18
+Evaluate model
+        ↓
+STEP 19
+Tune threshold for macro F0.5
+        ↓
+STEP 20
+Optimize singleton handling
+        ↓
+STEP 21
+Error analysis
+        ↓
+STEP 22
+Improve blocking/features
+        ↓
+STEP 23
+Run test inference
+        ↓
+STEP 24
+Generate candidate_pairs.tsv
+        ↓
+STEP 25
+Generate matching_results.tsv
+        ↓
+STEP 26
+Run official validator
+        ↓
+STEP 27
+Submit
+        ↓
+STEP 28
+Record leaderboard result
+        ↓
+STEP 29
+Controlled experiments
+        ↓
+STEP 30
+Finalize model
+        ↓
+STEP 31
+README + requirements
+        ↓
+STEP 32
+Documentation
+        ↓
+STEP 33
+Final ZIP
+The three stages we should optimize in order
+
+1. Blocking recall
+
+Did we find the true match among the candidates?
+
+2. Matching precision
+
+Can the model remove the look-alikes?
+
+3. Macro F₀.₅
+
+Does the complete S1-level prediction perform well under the actual competition metric?
+
+That ordering follows the challenge's own explanation: blocking determines the recall ceiling, the matching model filters candidates, and the final submission is evaluated using precision-weighted macro F₀.₅.
+
+One final principle: we should not start coding the sophisticated matcher until we have actually measured blocking recall on the training validation split. If the correct pair never enters the block, no amount of model wizardry can resurrect it. That's the central engineering constraint of this challenge.
+
+Our planned architecture is:
+                 RAW TSV
+                    │
+                    ▼
+              pandas
+                    │
+                    ▼
+            Normalization
+             pandas + Python
+                    │
+                    ▼
+               Blocking
+          pandas + dictionaries
+                    │
+                    ▼
+            Candidate pairs
+                    │
+                    ▼
+          Similarity features
+        ┌───────────┴───────────┐
+        │                       │
+    rapidfuzz              scikit-learn
+        │                       │
+ Levenshtein             TF-IDF cosine
+ Jaro-Winkler            Jaccard etc.
+        │                       │
+        └───────────┬───────────┘
+                    ▼
+             XGBoost model
+                    │
+                    ▼
+            Match probability
+                    │
+                    ▼
+          Threshold / singleton
+                    │
+                    ▼
+        matching_results.tsv
+
+
