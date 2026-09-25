@@ -113,3 +113,11 @@ dist/
 
 .cache/
 cache/
+
+# Microsoft Office temporary/lock files
+~$*.docx
+~$*.xlsx
+~$*.pptx
+~$*.xls
+~$*.doc
+~$*.ppt
