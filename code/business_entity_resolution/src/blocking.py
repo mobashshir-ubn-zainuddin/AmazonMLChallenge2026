@@ -178,34 +178,41 @@ def create_blocking_keys(df: pd.DataFrame) -> pd.DataFrame:
     # 1. Independent name blocks
     # -------------------------------------------------------------
 
+    # A blocking key is valid only when all fields required by
+    # that strategy are non-empty.
     result["block_name_exact"] = (
-        country
-        + "|"
-        + name
+        country + "|" + name
+    ).where(
+        country.ne("") & name.ne(""),
+        ""
     )
 
     result["block_name_no_suffix"] = (
-        country
-        + "|"
-        + name_no_suffix
+        country + "|" + name_no_suffix
+    ).where(
+        country.ne("") & name_no_suffix.ne(""),
+        ""
     )
 
     result["block_name_sorted"] = (
-        country
-        + "|"
-        + name_sorted
+        country + "|" + name_sorted
+    ).where(
+        country.ne("") & name_sorted.ne(""),
+        ""
     )
 
     result["block_name_prefix4"] = (
-        country
-        + "|"
-        + name_prefix4
+        country + "|" + name_prefix4
+    ).where(
+        country.ne("") & name_prefix4.ne(""),
+        ""
     )
 
     result["block_name_token"] = (
-        country
-        + "|"
-        + longest_name
+        country + "|" + longest_name
+    ).where(
+        country.ne("") & longest_name.ne(""),
+        ""
     )
 
     # -------------------------------------------------------------
@@ -213,21 +220,24 @@ def create_blocking_keys(df: pd.DataFrame) -> pd.DataFrame:
     # -------------------------------------------------------------
 
     result["block_address_exact"] = (
-        country
-        + "|"
-        + address
+        country + "|" + address
+    ).where(
+        country.ne("") & address.ne(""),
+        ""
     )
 
     result["block_address_numbers"] = (
-        country
-        + "|"
-        + address_numbers
+        country + "|" + address_numbers
+    ).where(
+        country.ne("") & address_numbers.ne(""),
+        ""
     )
 
     result["block_address_token"] = (
-        country
-        + "|"
-        + longest_address
+        country + "|" + longest_address
+    ).where(
+        country.ne("") & longest_address.ne(""),
+        ""
     )
 
     # -------------------------------------------------------------
@@ -241,6 +251,11 @@ def create_blocking_keys(df: pd.DataFrame) -> pd.DataFrame:
         + name
         + "|"
         + address
+    ).where(
+        country.ne("")
+        & name.ne("")
+        & address.ne(""),
+        ""
     )
 
     # Name after legal-suffix removal + exact address
@@ -250,6 +265,11 @@ def create_blocking_keys(df: pd.DataFrame) -> pd.DataFrame:
         + name_no_suffix
         + "|"
         + address
+    ).where(
+        country.ne("")
+        & name_no_suffix.ne("")
+        & address.ne(""),
+        ""
     )
 
     # Name after legal-suffix removal + address numbers
@@ -259,6 +279,11 @@ def create_blocking_keys(df: pd.DataFrame) -> pd.DataFrame:
         + name_no_suffix
         + "|"
         + address_numbers
+    ).where(
+        country.ne("")
+        & name_no_suffix.ne("")
+        & address_numbers.ne(""),
+        ""
     )
 
     # First four characters of name + first address number
@@ -268,6 +293,11 @@ def create_blocking_keys(df: pd.DataFrame) -> pd.DataFrame:
         + name_prefix4
         + "|"
         + first_address_number
+    ).where(
+        country.ne("")
+        & name_prefix4.ne("")
+        & first_address_number.ne(""),
+        ""
     )
 
     return result
