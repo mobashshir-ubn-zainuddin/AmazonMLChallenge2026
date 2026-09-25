@@ -1,71 +1,51 @@
 """
-Evaluate blocking recall on the training ground truth.
+Vectorized blocking-recall evaluation for Amazon ML Challenge 2026.
 
-Important:
-This script evaluates whether true S1 -> S2/S3 pairs share at least
-one blocking key.
+Evaluates whether known ground-truth S1 -> S2/S3 pairs share
+each blocking key.
 
-It does NOT generate the final candidate_pairs.tsv.
+This script does NOT generate candidate_pairs.tsv.
 
-The purpose is to determine the recall ceiling of the blocking stage
-before we build the full candidate-generation pipeline.
+It measures:
+
+1. Recall of each blocking strategy
+2. Recall of the UNION of all strategies
+3. Number of true pairs recovered
+
+The evaluation is performed in chunks to avoid constructing
+the complete multi-million-row pair table in memory.
 """
 
 from pathlib import Path
-from typing import Dict, List
 
 import pandas as pd
 
 from .blocking import (
     BLOCKING_STRATEGIES,
-    create_blocking_keys,
-    pair_survives_blocking,
+    _longest_token,
+    _first_address_number,
 )
 
 
-# ---------------------------------------------------------------------
+# ============================================================
 # Configuration
-# ---------------------------------------------------------------------
+# ============================================================
 
-CHUNK_SIZE = 100_000
+GT_CHUNK_SIZE = 100_000
 
-REQUIRED_SOURCE_COLUMNS = [
-    "entity_id",
-    "country_clean",
-    "name_clean",
-    "name_no_legal_suffix",
-    "name_sorted_tokens",
-    "name_tokens",
-    "address_clean",
-    "address_numbers",
-    "address_tokens",
-]
+STRATEGIES = BLOCKING_STRATEGIES
 
 
-# ---------------------------------------------------------------------
+# ============================================================
 # Paths
-# ---------------------------------------------------------------------
+# ============================================================
 
 def get_paths():
-    """Return all project paths."""
 
     project_root = Path(__file__).resolve().parents[3]
 
-    paths = {
+    return {
         "project_root": project_root,
-
-        "train_dir": (
-            project_root
-            / "dataset"
-            / "dataset"
-            / "train"
-        ),
-
-        "processed_train_dir": (
-            project_root
-            / "processed"
-            / "train"
-        ),
 
         "ground_truth": (
             project_root
@@ -75,6 +55,12 @@ def get_paths():
             / "train_ground_truth.tsv"
         ),
 
+        "processed_train": (
+            project_root
+            / "processed"
+            / "train"
+        ),
+
         "output_dir": (
             project_root
             / "code"
@@ -82,25 +68,328 @@ def get_paths():
         ),
     }
 
-    return paths
+
+# ============================================================
+# Mapping between strategy and blocking column
+# ============================================================
+
+def strategy_column(strategy):
+
+    mapping = {
+        "name_exact":
+            "block_name_exact",
+
+        "name_no_suffix_exact":
+            "block_name_no_suffix",
+
+        "name_sorted_exact":
+            "block_name_sorted",
+
+        "name_prefix4":
+            "block_name_prefix4",
+
+        "name_token":
+            "block_name_token",
+
+        "address_exact":
+            "block_address_exact",
+
+        "address_numbers":
+            "block_address_numbers",
+
+        "address_token":
+            "block_address_token",
+
+        "name_address_exact":
+            "block_name_address_exact",
+
+        "name_no_suffix_address":
+            "block_name_no_suffix_address",
+
+        "name_no_suffix_address_numbers":
+            "block_name_no_suffix_address_numbers",
+
+        "name_prefix4_address_number":
+            "block_name_prefix4_address_number",
+    }
+
+    return mapping[strategy]
 
 
-# ---------------------------------------------------------------------
-# Load ground truth
-# ---------------------------------------------------------------------
-
-def load_ground_truth(path: Path) -> pd.DataFrame:
+# ============================================================
+# Read only one blocking key from a processed source
+# ============================================================
+def longest_token_series(series):
     """
-    Load ground truth and convert the comma-separated match list
-    into one row per true pair.
+    Reproduce the exact longest-token logic used by blocking.py.
+    """
+    return series.apply(_longest_token)
 
-    Output columns:
+def load_key_column(path, strategy):
+    """
+    Load only the columns required to construct one blocking key.
 
-        source1_entity_id
-        matched_entity_id
+    Blocking keys are generated here from the already-preprocessed
+    columns instead of expecting block_* columns to exist on disk.
     """
 
-    print(f"Loading ground truth: {path}")
+    required_columns = {
+        "name_exact": [
+            "entity_id",
+            "country_clean",
+            "name_clean",
+        ],
+        "name_no_suffix_exact": [
+            "entity_id",
+            "country_clean",
+            "name_no_legal_suffix",
+        ],
+        "name_sorted_exact": [
+            "entity_id",
+            "country_clean",
+            "name_sorted_tokens",
+        ],
+        "name_prefix4": [
+            "entity_id",
+            "country_clean",
+            "name_no_legal_suffix",
+        ],
+        "name_token": [
+            "entity_id",
+            "country_clean",
+            "name_tokens",
+        ],
+        "address_exact": [
+            "entity_id",
+            "country_clean",
+            "address_clean",
+        ],
+        "address_numbers": [
+            "entity_id",
+            "country_clean",
+            "address_numbers",
+        ],
+        "address_token": [
+            "entity_id",
+            "country_clean",
+            "address_tokens",
+        ],
+        "name_address_exact": [
+            "entity_id",
+            "country_clean",
+            "name_clean",
+            "address_clean",
+        ],
+        "name_no_suffix_address": [
+            "entity_id",
+            "country_clean",
+            "name_no_legal_suffix",
+            "address_clean",
+        ],
+        "name_no_suffix_address_numbers": [
+            "entity_id",
+            "country_clean",
+            "name_no_legal_suffix",
+            "address_numbers",
+        ],
+        "name_prefix4_address_number": [
+            "entity_id",
+            "country_clean",
+            "name_no_legal_suffix",
+            "address_numbers",
+        ],
+    }
+
+    if strategy not in required_columns:
+        raise ValueError(f"Unknown blocking strategy: {strategy}")
+
+    columns = required_columns[strategy]
+
+    print(f"Loading {path.name} for strategy [{strategy}]...")
+
+    df = pd.read_csv(
+        path,
+        sep="\t",
+        usecols=columns,
+        dtype=str,
+        keep_default_na=False,
+    )
+
+    country = df["country_clean"]
+
+    if strategy == "name_exact":
+        name = df["name_clean"]
+
+        key = (
+            country + "|" + name
+        ).where(
+            country.ne("") & name.ne(""),
+            ""
+        )
+
+    elif strategy == "name_no_suffix_exact":
+        name_no_suffix = df["name_no_legal_suffix"]
+
+        key = (
+            country + "|" + name_no_suffix
+        ).where(
+            country.ne("") & name_no_suffix.ne(""),
+            ""
+        )
+
+    elif strategy == "name_sorted_exact":
+        name_sorted = df["name_sorted_tokens"]
+
+        key = (
+            country + "|" + name_sorted
+        ).where(
+            country.ne("") & name_sorted.ne(""),
+            ""
+        )
+
+    elif strategy == "name_prefix4":
+        name_prefix4 = df["name_no_legal_suffix"].str[:4]
+
+        key = (
+            country + "|" + name_prefix4
+        ).where(
+            country.ne("") & name_prefix4.ne(""),
+            ""
+        )
+
+    elif strategy == "name_token":
+        longest_name = longest_token_series(
+            df["name_tokens"]
+        )
+
+        key = (
+            country + "|" + longest_name
+        ).where(
+            country.ne("") & longest_name.ne(""),
+            ""
+        )
+
+    elif strategy == "address_exact":
+        address = df["address_clean"]
+
+        key = (
+            country + "|" + address
+        ).where(
+            country.ne("") & address.ne(""),
+            ""
+        )
+
+    elif strategy == "address_numbers":
+        address_numbers = df["address_numbers"]
+
+        key = (
+            country + "|" + address_numbers
+        ).where(
+            country.ne("") & address_numbers.ne(""),
+            ""
+        )
+
+    elif strategy == "address_token":
+        longest_address = longest_token_series(
+            df["address_tokens"]
+        )
+
+        key = (
+            country + "|" + longest_address
+        ).where(
+            country.ne("") & longest_address.ne(""),
+            ""
+        )
+
+    elif strategy == "name_address_exact":
+        name = df["name_clean"]
+        address = df["address_clean"]
+
+        key = (
+            country
+            + "|"
+            + name
+            + "|"
+            + address
+        ).where(
+            country.ne("")
+            & name.ne("")
+            & address.ne(""),
+            ""
+        )
+
+    elif strategy == "name_no_suffix_address":
+        name_no_suffix = df["name_no_legal_suffix"]
+        address = df["address_clean"]
+
+        key = (
+            country
+            + "|"
+            + name_no_suffix
+            + "|"
+            + address
+        ).where(
+            country.ne("")
+            & name_no_suffix.ne("")
+            & address.ne(""),
+            ""
+        )
+
+    elif strategy == "name_no_suffix_address_numbers":
+        name_no_suffix = df["name_no_legal_suffix"]
+        address_numbers = df["address_numbers"]
+
+        key = (
+            country
+            + "|"
+            + name_no_suffix
+            + "|"
+            + address_numbers
+        ).where(
+            country.ne("")
+            & name_no_suffix.ne("")
+            & address_numbers.ne(""),
+            ""
+        )
+
+    elif strategy == "name_prefix4_address_number":
+        name_prefix4 = df["name_no_legal_suffix"].str[:4]
+        first_address_number = df["address_numbers"].apply(
+            _first_address_number
+        )
+
+        key = (
+            country
+            + "|"
+            + name_prefix4
+            + "|"
+            + first_address_number
+        ).where(
+            country.ne("")
+            & name_prefix4.ne("")
+            & first_address_number.ne(""),
+            ""
+        )
+
+    else:
+        raise ValueError(f"Unhandled strategy: {strategy}")
+
+    result = pd.DataFrame({
+        "entity_id": df["entity_id"],
+        "block_key": key,
+    })
+
+    return result
+
+# ============================================================
+# Load and expand ground truth
+# ============================================================
+
+def load_ground_truth_pairs(path):
+
+    print(
+        f"\nLoading ground truth: {path}"
+    )
 
     gt = pd.read_csv(
         path,
@@ -115,7 +404,6 @@ def load_ground_truth(path: Path) -> pd.DataFrame:
         .astype(str)
     )
 
-    # Explode comma-separated IDs.
     gt["matched_entity_id"] = (
         gt["matched_entity_ids"]
         .str.split(",")
@@ -138,267 +426,360 @@ def load_ground_truth(path: Path) -> pd.DataFrame:
         .str.strip()
     )
 
-    # Remove S1 rows with no match.
     gt = gt[
         gt["matched_entity_id"] != ""
     ].copy()
 
+    gt["source"] = (
+        gt["matched_entity_id"]
+        .str[:2]
+    )
+
     print(
-        f"True matched pairs: {len(gt):,}"
+        f"Total true matched pairs: "
+        f"{len(gt):,}"
+    )
+
+    print(
+        f"S2 true pairs: "
+        f"{(gt['source'] == 'S2').sum():,}"
+    )
+
+    print(
+        f"S3 true pairs: "
+        f"{(gt['source'] == 'S3').sum():,}"
     )
 
     return gt
 
 
-# ---------------------------------------------------------------------
-# Load processed source data
-# ---------------------------------------------------------------------
+# ============================================================
+# Evaluate one blocking strategy
+# ============================================================
 
-def load_processed_source(
-    path: Path,
-) -> pd.DataFrame:
-    """
-    Load only the columns required for blocking.
+def evaluate_strategy(
+    strategy,
+    gt,
+    source1_path,
+    source2_path,
+    source3_path,
+):
 
-    This function is intended for one source at a time.
-    """
+    column = strategy_column(strategy)
 
-    print(f"Loading: {path}")
-
-    df = pd.read_csv(
-        path,
-        sep="\t",
-        dtype=str,
-        keep_default_na=False,
-    )
-
-    missing = [
-        col
-        for col in REQUIRED_SOURCE_COLUMNS
-        if col not in df.columns
-    ]
-
-    if missing:
-        raise ValueError(
-            f"Missing columns in {path}: {missing}"
-        )
-
-    df = df[REQUIRED_SOURCE_COLUMNS].copy()
-
-    return df
-
-
-# ---------------------------------------------------------------------
-# Prepare blocking data
-# ---------------------------------------------------------------------
-
-def prepare_source(
-    path: Path,
-) -> pd.DataFrame:
-    """
-    Load a processed source and create blocking keys.
-    """
-
-    df = load_processed_source(path)
-
+    print("\n" + "=" * 75)
     print(
-        f"Loaded {len(df):,} records."
+        f"STRATEGY: {strategy}"
     )
-
-    df = create_blocking_keys(df)
-
-    return df
-
-
-# ---------------------------------------------------------------------
-# Evaluate one source
-# ---------------------------------------------------------------------
-
-def evaluate_source(
-    source1_df: pd.DataFrame,
-    candidate_df: pd.DataFrame,
-    ground_truth: pd.DataFrame,
-    source_name: str,
-) -> pd.DataFrame:
-    """
-    Evaluate blocking recall for one candidate source.
-
-    source_name is either S2 or S3.
-
-    Only true ground-truth pairs belonging to this source
-    are evaluated.
-    """
-
-    print("\n" + "=" * 70)
     print(
-        f"Evaluating blocking recall against {source_name}"
+        f"COLUMN : {column}"
     )
-    print("=" * 70)
+    print("=" * 75)
 
-    # -------------------------------------------------------------
-    # Restrict ground truth to this source.
-    # -------------------------------------------------------------
+    # --------------------------------------------------------
+    # Load only the relevant key from Source 1.
+    # --------------------------------------------------------
 
-    gt = ground_truth[
-        ground_truth["matched_entity_id"]
-        .str.startswith(source_name + "-")
-    ].copy()
-
-    print(
-        f"Ground-truth {source_name} pairs: "
-        f"{len(gt):,}"
+    s1 = load_key_column(
+        source1_path,
+        strategy,
     )
 
-    if gt.empty:
-        return pd.DataFrame()
-
-    # -------------------------------------------------------------
-    # Create lookup tables.
-    #
-    # Only true matched candidate records are required.
-    # -------------------------------------------------------------
-
-    source1_lookup = (
-        source1_df
-        .set_index("entity_id")
+    s1 = s1.rename(
+        columns={
+            "entity_id": "source1_entity_id",
+            "block_key": "s1_key",
+        }
     )
 
-    candidate_lookup = (
-        candidate_df
-        .set_index("entity_id")
-    )
-
-    # -------------------------------------------------------------
-    # Evaluate every true pair.
-    # -------------------------------------------------------------
-
-    counts = {
-        strategy: 0
-        for strategy in BLOCKING_STRATEGIES
-    }
-
-    any_block_count = 0
-
-    missing_s1 = 0
-    missing_candidate = 0
-
-    total_pairs = len(gt)
-
-    # Iterate through ground-truth pairs.
-    #
-    # This is deliberately simple and transparent.
-    # We will optimize further if profiling shows that it is
-    # necessary.
-    for row in gt.itertuples(index=False):
-
-        s1_id = row.source1_entity_id
-        candidate_id = row.matched_entity_id
-
-        if s1_id not in source1_lookup.index:
-            missing_s1 += 1
-            continue
-
-        if candidate_id not in candidate_lookup.index:
-            missing_candidate += 1
-            continue
-
-        s1_row = source1_lookup.loc[s1_id]
-        candidate_row = candidate_lookup.loc[candidate_id]
-
-        result = pair_survives_blocking(
-            s1_row,
-            candidate_row,
-        )
-
-        survived_any = False
-
-        for strategy, survived in result.items():
-
-            if survived:
-                counts[strategy] += 1
-                survived_any = True
-
-        if survived_any:
-            any_block_count += 1
-
-    # -------------------------------------------------------------
-    # Results
-    # -------------------------------------------------------------
+    # --------------------------------------------------------
+    # Evaluate S2 and S3 separately.
+    # --------------------------------------------------------
 
     results = []
 
-    for strategy in BLOCKING_STRATEGIES:
+    for source_name, source_path in [
+        ("S2", source2_path),
+        ("S3", source3_path),
+    ]:
 
-        recovered = counts[strategy]
+        print(
+            f"\nEvaluating {source_name}..."
+        )
+
+        # Only load the relevant blocking key.
+        candidate = load_key_column(
+            source_path,
+            strategy,
+        )
+
+        candidate = candidate.rename(
+            columns={
+                "entity_id": "matched_entity_id",
+                "block_key": "candidate_key",
+            }
+        )
+
+        # ----------------------------------------------------
+        # Restrict ground truth to this source.
+        # ----------------------------------------------------
+
+        source_gt = gt[
+            gt["source"] == source_name
+        ][
+            [
+                "source1_entity_id",
+                "matched_entity_id",
+            ]
+        ].copy().reset_index(drop=True)
+
+        total_pairs = len(source_gt)
+
+        # ----------------------------------------------------
+        # Merge S1 blocking key.
+        # ----------------------------------------------------
+
+        source_gt = source_gt.merge(
+            s1,
+            on="source1_entity_id",
+            how="left",
+            sort=False,
+        )
+
+        # ----------------------------------------------------
+        # Merge candidate blocking key.
+        # ----------------------------------------------------
+
+        source_gt = source_gt.merge(
+            candidate,
+            on="matched_entity_id",
+            how="left",
+            sort=False,
+        )
+
+        # ----------------------------------------------------
+        # A true pair survives if:
+        #
+        #   S1 key == candidate key
+        #
+        # and neither key is empty.
+        # ----------------------------------------------------
+
+        valid = (
+            source_gt["s1_key"].ne("")
+            &
+            source_gt["candidate_key"].ne("")
+            &
+            source_gt["s1_key"].eq(
+                source_gt["candidate_key"]
+            )
+        )
+
+        recovered = int(valid.sum())
 
         recall = (
             recovered / total_pairs
-            if total_pairs > 0
+            if total_pairs
             else 0.0
+        )
+
+        print(
+            f"{source_name}: "
+            f"{recovered:,} / "
+            f"{total_pairs:,} "
+            f"= {recall * 100:.4f}%"
         )
 
         results.append(
             {
-                "source": source_name,
                 "strategy": strategy,
+                "source": source_name,
                 "true_pairs": total_pairs,
                 "recovered_pairs": recovered,
                 "blocking_recall": recall,
             }
         )
 
-    union_recall = (
-        any_block_count / total_pairs
-        if total_pairs > 0
-        else 0.0
-    )
+        del candidate
+        del source_gt
 
-    results.append(
-        {
-            "source": source_name,
-            "strategy": "UNION_ALL",
-            "true_pairs": total_pairs,
-            "recovered_pairs": any_block_count,
-            "blocking_recall": union_recall,
+    del s1
+
+    return results
+
+
+# ============================================================
+# Evaluate UNION of all blocking strategies
+# ============================================================
+
+def evaluate_union(
+    gt,
+    source1_path,
+    source2_path,
+    source3_path,
+):
+
+    print("\n" + "=" * 75)
+    print("UNION OF ALL BLOCKING STRATEGIES")
+    print("=" * 75)
+
+    # --------------------------------------------------------
+    # For each strategy, evaluate whether a true pair survives.
+    #
+    # Store only boolean recovery flags per strategy/source.
+    # --------------------------------------------------------
+
+    union_results = []
+
+    for source_name, source_path in [
+        ("S2", source2_path),
+        ("S3", source3_path),
+    ]:
+
+        source_gt = gt[
+            gt["source"] == source_name
+        ][
+            [
+                "source1_entity_id",
+                "matched_entity_id",
+            ]
+        ].copy().reset_index(drop=True)
+
+        source_gt["survived_any"] = False
+
+        for strategy in STRATEGIES:
+
+            column = strategy_column(strategy)
+
+            print(
+                f"\n{source_name} | "
+                f"Checking {strategy}"
+            )
+
+            # ------------------------------------------------
+            # Load S1 key.
+            # ------------------------------------------------
+
+            s1 = load_key_column(
+                source1_path,
+                strategy,
+            )
+
+            s1 = s1.rename(
+        columns={
+            "entity_id": "source1_entity_id",
+            "block_key": "s1_key",
         }
     )
 
-    print("\n--- Blocking Recall ---")
+            # ------------------------------------------------
+            # Load candidate key.
+            # ------------------------------------------------
 
-    for result in results:
+            candidate = load_key_column(
+                source_path,
+                strategy,
+            )
 
-        print(
-            f"{result['strategy']:25s} "
-            f"{result['recovered_pairs']:>10,} / "
-            f"{result['true_pairs']:>10,} "
-            f"= "
-            f"{result['blocking_recall'] * 100:8.3f}%"
+            candidate = candidate.rename(
+                columns={
+                    "entity_id": "matched_entity_id",
+                    "block_key": "candidate_key",
+                }
+            )
+
+            # ------------------------------------------------
+            # Merge S1 key.
+            # ------------------------------------------------
+
+            temp = source_gt[
+                [
+                    "source1_entity_id",
+                    "matched_entity_id",
+                ]
+            ].merge(
+                s1,
+                on="source1_entity_id",
+                how="left",
+                sort=False,
+            )
+
+            # ------------------------------------------------
+            # Merge candidate key.
+            # ------------------------------------------------
+
+            temp = temp.merge(
+                candidate,
+                on="matched_entity_id",
+                how="left",
+                sort=False,
+            )
+
+            survived = (
+                temp["s1_key"].ne("")
+                &
+                temp["candidate_key"].ne("")
+                &
+                temp["s1_key"].eq(
+                    temp["candidate_key"]
+                )
+            )
+
+            source_gt.loc[
+                survived.index,
+                "survived_any"
+            ] |= survived.to_numpy()
+
+            recovered = int(
+                source_gt["survived_any"].sum()
+            )
+
+            print(
+                f"Current UNION recall: "
+                f"{recovered:,} / "
+                f"{len(source_gt):,} "
+                f"= "
+                f"{recovered / len(source_gt) * 100:.4f}%"
+            )
+
+            del s1
+            del candidate
+            del temp
+
+        total_pairs = len(source_gt)
+
+        recovered = int(
+            source_gt["survived_any"].sum()
         )
 
-    if missing_s1:
-        print(
-            f"\nWARNING: Missing S1 records: "
-            f"{missing_s1:,}"
+        recall = (
+            recovered / total_pairs
+            if total_pairs
+            else 0.0
         )
 
-    if missing_candidate:
-        print(
-            f"WARNING: Missing {source_name} records: "
-            f"{missing_candidate:,}"
+        union_results.append(
+            {
+                "strategy": "UNION_ALL",
+                "source": source_name,
+                "true_pairs": total_pairs,
+                "recovered_pairs": recovered,
+                "blocking_recall": recall,
+            }
         )
 
-    return pd.DataFrame(results)
+    return union_results
 
 
-# ---------------------------------------------------------------------
+# ============================================================
 # Main
-# ---------------------------------------------------------------------
+# ============================================================
 
 def main():
 
-    print("=" * 70)
+    print("=" * 75)
     print("BLOCKING RECALL ANALYSIS")
-    print("=" * 70)
+    print("=" * 75)
 
     paths = get_paths()
 
@@ -407,88 +788,72 @@ def main():
         exist_ok=True,
     )
 
-    # -------------------------------------------------------------
-    # 1. Load ground truth
-    # -------------------------------------------------------------
-
-    ground_truth = load_ground_truth(
-        paths["ground_truth"]
-    )
-
-    # -------------------------------------------------------------
-    # 2. Load Source 1
-    # -------------------------------------------------------------
+    # --------------------------------------------------------
+    # File paths
+    # --------------------------------------------------------
 
     source1_path = (
-        paths["processed_train_dir"]
+        paths["processed_train"]
         / "processed_train_source1.tsv"
     )
 
-    source1 = prepare_source(
-        source1_path
-    )
-
-    print(
-        f"\nSource 1 records: "
-        f"{len(source1):,}"
-    )
-
-    # -------------------------------------------------------------
-    # 3. Evaluate S2
-    # -------------------------------------------------------------
-
     source2_path = (
-        paths["processed_train_dir"]
+        paths["processed_train"]
         / "processed_train_source2.tsv"
     )
 
-    source2 = prepare_source(
-        source2_path
-    )
-
-    results_s2 = evaluate_source(
-        source1,
-        source2,
-        ground_truth,
-        "S2",
-    )
-
-    # Free Source 2 before loading Source 3.
-    del source2
-
-    # -------------------------------------------------------------
-    # 4. Evaluate S3
-    # -------------------------------------------------------------
-
     source3_path = (
-        paths["processed_train_dir"]
+        paths["processed_train"]
         / "processed_train_source3.tsv"
     )
 
-    source3 = prepare_source(
-        source3_path
+    # --------------------------------------------------------
+    # Load ground truth
+    # --------------------------------------------------------
+
+    gt = load_ground_truth_pairs(
+        paths["ground_truth"]
+    )
+    
+    # --------------------------------------------------------
+    # Evaluate individual strategies
+    # --------------------------------------------------------
+
+    all_results = []
+
+    for strategy in STRATEGIES:
+
+        results = evaluate_strategy(
+            strategy,
+            gt,
+            source1_path,
+            source2_path,
+            source3_path,
+        )
+
+        all_results.extend(results)
+
+    # --------------------------------------------------------
+    # Evaluate UNION
+    # --------------------------------------------------------
+
+    union_results = evaluate_union(
+        gt,
+        source1_path,
+        source2_path,
+        source3_path,
     )
 
-    results_s3 = evaluate_source(
-        source1,
-        source3,
-        ground_truth,
-        "S3",
+    all_results.extend(
+        union_results
     )
 
-    del source3
-    del source1
+    # --------------------------------------------------------
+    # Save results
+    # --------------------------------------------------------
 
-    # -------------------------------------------------------------
-    # 5. Combine results
-    # -------------------------------------------------------------
-
-    results = pd.concat(
-        [
-            results_s2,
-            results_s3,
-        ],
-        ignore_index=True,
+    results_df = pd.DataFrame(
+        all_results
     )
 
     output_path = (
@@ -496,23 +861,27 @@ def main():
         / "blocking_recall_results.csv"
     )
 
-    results.to_csv(
+    results_df.to_csv(
         output_path,
         index=False,
     )
 
-    print("\n" + "=" * 70)
-    print("FINAL RESULTS")
-    print("=" * 70)
+    # --------------------------------------------------------
+    # Print final table
+    # --------------------------------------------------------
+
+    print("\n" + "=" * 75)
+    print("FINAL BLOCKING RECALL RESULTS")
+    print("=" * 75)
 
     print(
-        results.to_string(
+        results_df.to_string(
             index=False
         )
     )
 
     print(
-        f"\nResults saved to:\n"
+        f"\nSaved results to:\n"
         f"{output_path}"
     )
 
