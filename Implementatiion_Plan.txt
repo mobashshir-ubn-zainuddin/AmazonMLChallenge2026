@@ -1,67 +1,1698 @@
-Amazon ML Challenge 2026
-Detailed Step-by-Step Implementation Plan
-Final architecture
-                         TRAIN DATA
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │   DATA LOADING  │
-                    └────────┬────────┘
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │       EDA       │
-                    └────────┬────────┘
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │ PREPROCESSING   │
-                    │ Name + Address  │
-                    └────────┬────────┘
-                             │
-              ┌──────────────┼──────────────┐
-              ▼              ▼              ▼
-         Name Blocks    Address Blocks   Combined Blocks
-              │              │              │
-              └──────────────┼──────────────┘
-                             ▼
-                    ┌─────────────────┐
-                    │ CANDIDATE UNION │
-                    └────────┬────────┘
-                             │
-                             ▼
-                    candidate_pairs.tsv
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │ PAIR FEATURES   │
-                    └────────┬────────┘
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │ MATCHING MODEL  │
-                    └────────┬────────┘
-                             │
-                             ▼
-                    Match probabilities
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │ THRESHOLDING    │
-                    │ + SINGLETONS    │
-                    └────────┬────────┘
-                             │
-                             ▼
-                    matching_results.tsv
-                             │
-                             ▼
-                    Official validator
+Amazon ML Challenge — Current Implementation & Achievements
 
-The challenge materials describe this exact two-stage architecture: blocking narrows the enormous comparison space, then the matching model scores candidates and retains true matches.
+At the current stage, the business entity resolution pipeline has completed the preprocessing, exploratory analysis, ground-truth analysis, blocking-strategy development, blocking implementation, and blocking-recall evaluation stages.
 
-PHASE 0: Set up the submission project
+The most important achievement so far is that the current blocking system recovers approximately 98% of the known true S1→S2/S3 matches on the training ground truth, before any machine-learning/fuzzy matching model is applied.
 
-The final ZIP should follow the prescribed structure:
+1. Problem Understanding
+
+The challenge is a business entity resolution / record linkage problem.
+
+The dataset contains three sources:
+
+Source 1 (S1) — canonical/reference business records
+Source 2 (S2) — noisy business records
+Source 3 (S3) — another noisy business source
+
+The task is to determine which S2/S3 records correspond to each S1 business.
+
+A key characteristic of the challenge is that an S1 entity can have:
+
+no matching entity
+exactly one matching entity
+multiple matching entities
+
+Therefore, this is not simply a one-to-one classification problem.
+
+The final output must contain:
+
+source1_entity_id    matched_entity_ids
+
+with potentially multiple matched IDs for a single S1.
+
+There is also a required candidate-pair file:
+
+source1_entity_id    candidate_entity_ids
+
+The candidate set must contain the final matches.
+
+2. Dataset Exploration / EDA
+
+The training data was first analyzed to understand its scale and structure.
+
+Training dataset size
+Source	Records
+Source 1	2,206,821
+Source 2	5,034,616
+Source 3	5,285,603
+Total	12,527,040
+
+So this is a 12.5-million-record entity resolution problem.
+
+A brute-force comparison of every S1 record against every S2/S3 record would be computationally impractical.
+
+This establishes why blocking/candidate generation is essential.
+
+3. Data Quality Analysis
+
+The training data was also analyzed for missing and unique values.
+
+Important observations:
+
+Missing business names: 15
+Missing addresses: 344,883
+Countries:
+US: 7,510,506
+India: 5,016,534
+
+There are also:
+
+12,527,040 unique entity IDs
+9,935,722 unique business names
+10,929,926 unique addresses
+
+This showed that names and addresses cannot simply be treated as exact identifiers.
+
+There is substantial variation/noise between sources.
+
+4. Preprocessing Pipeline
+
+A dedicated preprocessing module was implemented.
+
+The preprocessing is designed to normalize records while remaining Unicode-safe.
+
+The normalization includes:
+
+Unicode normalization
+
+Unicode normalization uses NFKC.
+
+This helps standardize equivalent Unicode representations.
+
+Case normalization
+
+Text is converted using Unicode-aware case folding rather than simple ASCII-only lowercasing.
+
+Whitespace normalization
+
+Repeated whitespace is normalized.
+
+Business-name normalization
+
+Business names are cleaned while preserving Unicode letters and numbers.
+
+Special symbols are normalized, including:
+
+& → and
+@ → at
+
+Punctuation is removed appropriately.
+
+Legal suffix handling
+
+Business legal suffixes are identified and removable.
+
+Examples include:
+
+Inc
+Incorporated
+Ltd
+Limited
+LLC
+Corp
+Corporation
+Co
+Company
+PLC
+Pvt
+SARL
+SA
+SAS
+EURL
+SC
+SNC
+
+This produces:
+
+name_no_legal_suffix
+
+in addition to the normal cleaned name.
+
+Address preprocessing
+
+Addresses are normalized separately.
+
+The preprocessing extracts:
+
+address_numbers
+address_tokens
+address_sorted_tokens
+
+These later become useful for blocking.
+
+Country normalization
+
+Country values are normalized.
+
+For example:
+
+United States
+USA
+
+are normalized to:
+
+us
+
+Importantly, the pipeline does not hard-code the entire system to only the countries present in training.
+
+This matters because the test set introduces France.
+
+5. Processed Dataset
+
+The preprocessing stage successfully generated processed TSV files.
+
+The processed test datasets currently have:
+
+Dataset	Rows
+Test S1	1,732,544
+Test S2	4,887,273
+Test S3	5,082,316
+
+The preprocessing creates fields including:
+
+country_clean
+name_clean
+name_no_legal_suffix
+name_tokens
+name_sorted_tokens
+address_clean
+address_numbers
+address_tokens
+address_sorted_tokens
+
+These normalized representations form the basis of the downstream entity-resolution system.
+
+The preprocessing test suite was also run successfully on sampled records.
+
+6. Ground-Truth Analysis
+
+The training ground truth was analyzed before designing blocking.
+
+The ground truth contains:
+
+source1_entity_id
+matched_entity_ids
+
+where matched_entity_ids can contain multiple IDs.
+
+The total number of known true matching pairs is:
+
+7,638,365
+
+broken down into:
+
+Source	True matching pairs
+S2	3,693,619
+S3	3,944,746
+Total	7,638,365
+7. Distribution of Number of Matches per S1
+
+The ground truth contains:
+
+Number of matches	S1 records
+0	123,247
+1	119,157
+2	375,212
+3	530,841
+4	484,115
+5	321,957
+6	164,868
+7	63,968
+8	18,680
+9	4,205
+10	534
+11	37
+
+Therefore:
+
+123,247 S1 entities have no match
+119,157 have exactly one match
+1,964,417 have multiple matches
+
+The average number of matches per S1 is approximately:
+
+3.4613
+
+and the maximum is:
+
+11
+
+This is important because the eventual matcher must support one-to-many matching rather than forcing exactly one match per S1.
+
+8. Why Blocking Was Implemented
+
+The raw scale makes exhaustive pairwise matching infeasible.
+
+There are millions of records in S2 and S3.
+
+Therefore, the system uses:
+
+S1 record
+   ↓
+Blocking
+   ↓
+Small candidate set
+   ↓
+Detailed matching
+
+rather than:
+
+S1 record
+   ↓
+Compare against millions of S2/S3 records
+
+The purpose of blocking is not to make the final entity-resolution decision.
+
+Its purpose is:
+
+Remove obviously irrelevant records while retaining as many true matches as possible.
+
+This distinction is important.
+
+9. Blocking Architecture
+
+A dedicated blocking.py module was implemented.
+
+It currently contains 12 blocking strategies.
+
+They are divided into three groups.
+
+9.1 Name-based blocking
+1. name_exact
+
+Uses:
+
+country + name_clean
+
+Conceptually:
+
+us|amazon
+2. name_no_suffix_exact
+
+Uses:
+
+country + name_no_legal_suffix
+
+This handles differences such as:
+
+ABC Corporation
+ABC Corp
+ABC
+
+where legal suffixes should not prevent a match.
+
+3. name_sorted_exact
+
+Uses the sorted name-token representation.
+
+This helps with token-order variation.
+
+For example, conceptually:
+
+ABC Global Services
+
+versus:
+
+Global Services ABC
+
+can share the same sorted-token representation.
+
+4. name_prefix4
+
+Uses:
+
+country + first 4 characters of name_no_legal_suffix
+
+This is intentionally broader than exact matching.
+
+It provides substantial recall for noisy names.
+
+5. name_token
+
+Uses the longest meaningful token from the normalized name.
+
+The exact helper logic is:
+
+split into tokens
+remove duplicates for selection
+prioritize longest token
+tokens of length ≥4 are preferred
+deterministic lexical ordering is used when lengths are equal
+
+This logic is implemented centrally in _longest_token().
+
+10. Address-Based Blocking
+
+Three independent address strategies are implemented.
+
+6. address_exact
+
+Uses:
+
+country + address_clean
+
+This captures records where the normalized address is identical.
+
+7. address_numbers
+
+Uses:
+
+country + address_numbers
+
+This captures records that may have significantly different address text but share the extracted address numbers.
+
+This turns out to be particularly useful.
+
+8. address_token
+
+Uses the longest meaningful address token.
+
+This provides a broader address-based blocking route.
+
+11. Composite Blocking
+
+Four combined name/address strategies were implemented.
+
+9. name_address_exact
+
+Uses:
+
+country
++
+name_clean
++
+address_clean
+10. name_no_suffix_address
+
+Uses:
+
+country
++
+name_no_legal_suffix
++
+address_clean
+11. name_no_suffix_address_numbers
+
+Uses:
+
+country
++
+name_no_legal_suffix
++
+address_numbers
+12. name_prefix4_address_number
+
+Uses:
+
+country
++
+first four characters of name_no_legal_suffix
++
+first address number
+
+These composite strategies provide additional routes for records where both name and address contain useful information.
+
+12. Missing-Value Handling Was Corrected
+
+An important blocking issue was identified and fixed.
+
+Previously, a missing address could theoretically produce:
+
+us|
+
+instead of an invalid/empty blocking key.
+
+Similarly, partially missing composite fields could produce keys such as:
+
+us|company|
+
+Those are undesirable because many records could accidentally enter the same block.
+
+The implementation was corrected so that a blocking key is only valid when all fields required by that strategy are non-empty.
+
+For example:
+
+(country + "|" + address).where(
+    country.ne("") & address.ne(""),
+    ""
+)
+
+Therefore:
+
+country = us
+address = ""
+
+produces:
+
+""
+
+rather than:
+
+"us|"
+
+For composite keys, every required component must be populated.
+
+This is particularly important because the dataset contains a substantial number of missing addresses.
+
+13. Consistency Between Blocking and Recall Evaluation
+
+A separate blocking_recall.py was implemented to evaluate the blocking strategies against the known training ground truth.
+
+A critical design requirement was established:
+
+blocking.py and blocking_recall.py must produce exactly the same blocking key for the same record and strategy.
+
+The recall evaluator therefore reconstructs the keys from the processed TSVs rather than relying on pre-generated block columns.
+
+It also uses the same:
+
+_longest_token()
+
+and:
+
+_first_address_number()
+
+helpers.
+
+This avoids evaluating one implementation while eventually using a different implementation.
+
+14. Memory-Aware Recall Evaluation
+
+The dataset is too large to construct a complete S1 × S2/S3 pair table.
+
+Therefore, blocking_recall.py evaluates the known ground-truth pairs directly.
+
+It loads only the relevant blocking key for each strategy.
+
+For example:
+
+name_exact
+
+loads only the columns necessary for that strategy.
+
+The evaluation is therefore much more memory-conscious than constructing all possible candidate pairs.
+
+15. Individual Blocking Results
+
+The latest complete run produced the following results.
+
+S2
+Strategy	Recall
+name_exact	21.2969%
+name_no_suffix_exact	38.2663%
+name_sorted_exact	26.5790%
+name_prefix4	76.8511%
+name_token	63.8060%
+address_exact	12.5086%
+address_numbers	57.3856%
+address_token	79.4032%
+name_address_exact	2.6909%
+name_no_suffix_address	4.7747%
+name_no_suffix_address_numbers	22.1253%
+name_prefix4_address_number	53.0254%
+S3
+Strategy	Recall
+name_exact	22.0881%
+name_no_suffix_exact	36.7773%
+name_sorted_exact	27.1346%
+name_prefix4	75.5369%
+name_token	64.5068%
+address_exact	4.3207%
+address_numbers	60.2135%
+address_token	55.8431%
+name_address_exact	0.0034%
+name_no_suffix_address	0.0614%
+name_no_suffix_address_numbers	21.4053%
+name_prefix4_address_number	51.4013%
+
+These numbers demonstrate that no individual blocking strategy is sufficient.
+
+Different strategies recover different subsets of true matches.
+
+16. UNION of Blocking Strategies
+
+The major achievement is the UNION evaluation.
+
+For every ground-truth pair, the system checks whether:
+
+Strategy 1 OR
+Strategy 2 OR
+Strategy 3 OR
+...
+Strategy 12
+
+can recover the pair.
+
+This produces the cumulative blocking recall.
+
+S2 cumulative recall
+
+The progression was:
+
+name_exact                    21.2969%
+name_no_suffix_exact          38.2665%
+name_sorted_exact             43.4981%
+name_prefix4                  79.2338%
+name_token                    84.3272%
+address_exact                 86.2609%
+address_numbers               93.1927%
+address_token                 98.1153%
+
+The remaining composite strategies did not increase the final S2 UNION recall.
+
+Final:
+
+3,624,004 / 3,693,619
+= 98.1153%
+17. S3 cumulative recall
+
+The progression was:
+
+name_exact                    22.0881%
+name_no_suffix_exact          36.7773%
+name_sorted_exact             41.7780%
+name_prefix4                  77.9430%
+name_token                    85.3429%
+address_exact                 87.6098%
+address_numbers               94.9259%
+address_token                 97.6407%
+
+Again, the remaining composite strategies did not increase the final UNION recall.
+
+Final:
+
+3,851,677 / 3,944,746
+= 97.6407%
+18. Overall Blocking Achievement
+
+Combining S2 and S3:
+
+Total true pairs:
+7,638,365
+
+Recovered:
+
+3,624,004 + 3,851,677
+= 7,475,681
+
+Missed:
+
+7,638,365 - 7,475,681
+= 162,684
+
+Overall pair-level recall is therefore approximately:
+
+97.87%
+
+So the current blocking system successfully places approximately 97.87% of all known true training matches into the candidate space.
+
+19. What This Means for the Pipeline
+
+The current state is:
+
+                    CURRENT STATUS
+
+Raw 12.5M records
+        │
+        ▼
+┌─────────────────────┐
+│ Data Analysis / EDA │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│   Preprocessing     │
+│ Unicode-safe        │
+│ Name normalization  │
+│ Address normalization│
+│ Country normalization│
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│ Ground Truth        │
+│ Analysis            │
+│ 7.64M true pairs    │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│ Blocking            │
+│ 12 strategies       │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│ Blocking Recall     │
+│ S2: 98.1153%        │
+│ S3: 97.6407%        │
+└──────────┬──────────┘
+           │
+           ▼
+       NEXT STAGE
+ Candidate Generation
+           │
+           ▼
+    Matching Model
+           │
+           ▼
+   Final Submission
+20. What Has NOT Been Implemented Yet
+
+The current results should not be interpreted as the final challenge solution.
+
+The following stages are still pending:
+
+Candidate generation
+
+We have evaluated whether true pairs survive the blocking strategies, but we have not yet generated the final:
+
+output/candidate_pairs.tsv
+
+The candidate file needs to contain the actual candidate set for every test S1.
+
+Matching model
+
+No final entity-resolution classifier/scoring model has yet been applied.
+
+For example, we have not yet implemented the final decision based on combinations of:
+
+name similarity
+address similarity
+token similarity
+country
+etc.
+
+The exact final feature/model design remains to be developed.
+
+Threshold calibration
+
+No final matching threshold has yet been calibrated against the training ground truth.
+
+This is important because the challenge metric is F0.5, which makes false positives particularly consequential.
+
+Final test prediction
+
+We have not yet produced:
+
+output/matching_results.tsv
+
+for the test dataset.
+
+Final submission validation
+
+The final submission has not yet been constructed or validated with:
+
+dataset\utils\validate_submission.py
+21. Current Deliverables / Artifacts
+
+At this stage, the project has working components for:
+
+Source code
+code/
+└── business_entity_resolution/
+    └── src/
+        ├── config.py
+        ├── data_analysis.py
+        ├── preprocessing.py
+        ├── run_preprocessing.py
+        ├── test_preprocessing.py
+        ├── ground_truth_analysis.py
+        ├── blocking.py
+        ├── blocking_recall.py
+        └── test_blocking.py
+Processed data
+processed/
+├── train/
+└── test/
+Blocking analysis
+code/
+└── blocking_results/
+    └── blocking_recall_results.csv
+
+The latest run successfully generated this result file.
+
+22. Current Technical Baseline
+
+The most useful way to summarize the current achievement is:
+
+Component	Status
+Dataset understanding	✅ Complete
+EDA	✅ Complete
+Unicode-safe preprocessing	✅ Complete
+Name normalization	✅ Complete
+Legal suffix normalization	✅ Complete
+Address normalization	✅ Complete
+Country normalization	✅ Complete
+Train/test preprocessing	✅ Complete
+Ground-truth analysis	✅ Complete
+12 blocking strategies	✅ Complete
+Missing-value-safe blocking	✅ Implemented
+Blocking unit tests	✅ Implemented
+Blocking recall evaluation	✅ Complete
+S2 blocking recall	98.1153%
+S3 blocking recall	97.6407%
+Overall pair-level blocking recall	≈97.87%
+Final test candidate generation	⏳ Next
+Candidate-size analysis	⏳ Next
+Matching model	⏳ Pending
+Threshold calibration	⏳ Pending
+Final matching_results.tsv	⏳ Pending
+Final candidate_pairs.tsv	⏳ Pending
+Submission validation	⏳ Pending
+Bottom line
+
+The project has now moved well beyond basic data preparation. The entire preprocessing → ground-truth analysis → blocking design → blocking validation pipeline is operational.
+
+The strongest quantitative result so far is:
+
+7,475,681 of 7,638,365 known training matching pairs survive the current UNION of 12 blocking strategies, giving approximately 97.87% overall pair-level blocking recall.
+
+That means the current candidate-generation foundation is capable of retaining the overwhelming majority of known matches. The next engineering problem is no longer basic blocking implementation; it is to analyze the remaining 162,684 missed true pairs, construct the actual test candidate sets, control candidate-set size, and then build the high-precision matcher on top of those candidates.
+
+
+
+
+
+
+
+
+
+
+Amazon ML Challenge — What Needs to Be Implemented Next
+
+Now that preprocessing, ground-truth analysis, blocking, and blocking-recall evaluation are complete, the project should move through the remaining stages in a controlled sequence.
+
+The key principle is:
+
+Do not jump directly from the current 97.87% blocking recall to a final matcher. First understand the missed matches and the size/quality of the candidate sets.
+
+The recommended implementation roadmap is:
+
+CURRENT STATE
+     │
+     ▼
+1. Analyze blocking misses
+     │
+     ▼
+2. Analyze candidate-block sizes
+     │
+     ▼
+3. Finalize blocking strategies
+     │
+     ▼
+4. Build actual candidate generator
+     │
+     ▼
+5. Validate candidate recall on TRAIN
+     │
+     ▼
+6. Engineer pairwise matching features
+     │
+     ▼
+7. Build training examples
+     │
+     ▼
+8. Train/calibrate matcher
+     │
+     ▼
+9. Determine final matching rules
+     │
+     ▼
+10. Run matcher on TEST candidates
+     │
+     ▼
+11. Generate candidate_pairs.tsv
+     │
+     ▼
+12. Generate matching_results.tsv
+     │
+     ▼
+13. Validate submission
+     │
+     ▼
+14. Package final ZIP
+
+Below is exactly what each stage should implement.
+
+STEP 1 — Analyze the 162,684 Blocking Misses
+Objective
+
+We currently know:
+
+Total true pairs       7,638,365
+Recovered               7,475,681
+Missed                    162,684
+
+But we do not yet know why those 162,684 pairs were missed.
+
+This must be investigated before changing blocking.
+
+1.1 Create
+code/business_entity_resolution/src/blocking_miss_analysis.py
+
+The script should:
+
+Load train_ground_truth.tsv
+Load the processed S1/S2/S3 data
+Reconstruct the same 12 blocking keys
+For every true pair:
+check all 12 strategies
+identify whether at least one strategy matches
+Keep only pairs that fail all 12 strategies
+Analyze their characteristics
+1.2 Produce statistics separately for S2 and S3
+
+For example:
+
+S2
+-----
+Total true pairs
+Recovered by blocking
+Missed by all strategies
+
+S3
+-----
+Total true pairs
+Recovered by blocking
+Missed by all strategies
+1.3 Analyze the missed pairs
+
+For every missed pair, calculate features such as:
+
+Name
+S1 name
+S2/S3 name
+name missing?
+exact equality?
+token overlap?
+character similarity?
+length difference?
+Address
+S1 address
+S2/S3 address
+address missing?
+address-number overlap?
+token overlap?
+character similarity?
+Country
+S1 country
+candidate country
+same country?
+Existing blocking outcomes
+
+Record:
+
+name_exact = false
+name_no_suffix_exact = false
+...
+address_token = false
+...
+1.4 Identify patterns
+
+The goal is to discover whether the missed pairs are predominantly:
+
+heavily corrupted names
+heavily corrupted addresses
+missing names
+missing addresses
+transliteration differences
+token-level changes
+abbreviations
+reordered words
+different address-number formats
+country inconsistencies
+extremely noisy records
+
+This determines whether another blocking strategy is actually justified.
+
+STEP 2 — Analyze Candidate Block Sizes
+
+High recall alone is not enough.
+
+The current strategies include broad blocks such as:
+
+name_prefix4
+name_token
+address_numbers
+address_token
+
+These can generate many candidates.
+
+The next script should determine the actual candidate volume.
+
+2.1 Create
+code/business_entity_resolution/src/blocking_candidate_analysis.py
+
+For each blocking strategy:
+
+Build the S1 block index
+Build S2/S3 block index
+Calculate how many candidates each S1 receives
+
+For example:
+
+strategy                    mean    median    p95    p99    max
+----------------------------------------------------------------
+name_exact
+name_no_suffix_exact
+name_prefix4
+name_token
+address_numbers
+address_token
+...
+2.2 Measure candidate counts
+
+For each S1:
+
+candidate_count
+
+Then calculate:
+
+mean
+median
+P90
+P95
+P99
+maximum
+total candidate pairs
+
+Do this separately for:
+
+S1 → S2
+S1 → S3
+
+and for:
+
+S2 + S3
+2.3 Measure union candidate volume
+
+This is particularly important.
+
+The final blocking system is:
+
+candidate_union =
+    candidates(name_exact)
+    ∪ candidates(name_no_suffix_exact)
+    ∪ ...
+    ∪ candidates(name_prefix4_address_number)
+
+We need to know:
+
+How many total candidate pairs does this produce?
+
+This determines whether the matcher is computationally practical.
+
+STEP 3 — Decide Whether Additional Blocking Is Required
+
+Only after Steps 1 and 2 should blocking be modified.
+
+There are two possibilities.
+
+Case A — Misses are difficult/noisy
+
+If the missed 162,684 pairs are mostly severe corruption, adding another simple blocking key may not help.
+
+In that case, keep the current 12 strategies.
+
+Case B — Misses show a clear recoverable pattern
+
+For example, if many missed pairs share:
+
+same country
++
+high name-token overlap
++
+different token ordering
+
+but don't satisfy existing keys, then add a targeted blocking strategy.
+
+Any new strategy must be:
+
+tested on training recall
+measured for candidate explosion
+added only if its recall gain justifies its candidate cost
+
+Do not add strategies merely because they increase recall.
+
+STEP 4 — Build the Actual Candidate Generator
+
+This is the next major implementation.
+
+Create:
+
+code/business_entity_resolution/src/candidate_generation.py
+
+Its purpose is different from blocking_recall.py.
+
+blocking_recall.py
+
+answers:
+
+Did a known true pair survive?
+
+candidate_generation.py
+
+actually produces:
+
+candidate_pairs.tsv
+
+for the test set.
+
+STEP 5 — Candidate Generator Architecture
+
+The candidate generator should process:
+
+TEST S1
+    │
+    ├── name_exact
+    ├── name_no_suffix_exact
+    ├── name_sorted_exact
+    ├── name_prefix4
+    ├── name_token
+    ├── address_exact
+    ├── address_numbers
+    ├── address_token
+    ├── name_address_exact
+    ├── name_no_suffix_address
+    ├── name_no_suffix_address_numbers
+    └── name_prefix4_address_number
+             │
+             ▼
+       UNION candidates
+
+For each test S1:
+
+source1_entity_id
+
+retrieve candidate IDs from S2 and S3.
+
+STEP 6 — Candidate Generation Must Be Memory-Aware
+
+Do not create a gigantic Cartesian product.
+
+Use inverted indexes such as:
+
+block_key → entity IDs
+
+Conceptually:
+
+S2 index:
+
+us|amazon
+    → [S2-123, S2-456, S2-789]
+
+us|apple
+    → [S2-321, S2-654]
+
+Then an S1 record can retrieve candidates directly from the relevant blocks.
+
+STEP 7 — Candidate Deduplication
+
+A single candidate can be retrieved by multiple blocking strategies.
+
+For example:
+
+S1-100
+    name_prefix4 → S2-500
+    name_token   → S2-500
+    address_token → S2-500
+
+The candidate should appear only once.
+
+Therefore:
+
+candidate_set =
+    union of all candidate IDs
+
+not:
+
+candidate_list =
+    duplicate candidate IDs
+
+The final candidate file must contain unique candidate IDs for each S1.
+
+STEP 8 — Candidate Recall Validation on TRAIN
+
+Before generating the test candidate file, run the exact candidate generator on the training data.
+
+This is extremely important.
+
+We need to verify:
+
+Every true pair that should survive blocking
+
+actually appears in the candidate generator output.
+
+The candidate generator's measured recall should agree with the previously calculated blocking UNION recall.
+
+Expected approximate baseline:
+
+S2 ≈ 98.1153%
+S3 ≈ 97.6407%
+
+If candidate generation produces substantially different recall, there is a bug.
+
+STEP 9 — Candidate-Pair Statistics
+
+Once candidate generation works, measure:
+
+Total S1 records
+Total candidate pairs
+Average candidates/S1
+Median candidates/S1
+P95
+P99
+Maximum
+
+Also separately:
+
+S2 candidate pairs
+S3 candidate pairs
+
+This becomes one of the most important engineering metrics in the project.
+
+STEP 10 — Build Pairwise Matching Features
+
+Once the candidate set is ready, the next stage is the actual entity matching model.
+
+Create something such as:
+
+code/business_entity_resolution/src/matching_features.py
+
+For each:
+
+S1 ↔ candidate S2/S3
+
+pair, calculate features.
+
+STEP 11 — Name Similarity Features
+
+Use multiple representations rather than one similarity score.
+
+Potential features:
+
+Exact normalized name
+name_clean equality
+Legal-suffix-normalized equality
+name_no_legal_suffix equality
+Token similarity
+
+Compare:
+
+name_tokens
+
+between S1 and candidate.
+
+Sorted-token similarity
+
+Compare:
+
+name_sorted_tokens
+Character similarity
+
+Use an appropriate normalized string similarity metric.
+
+Length features
+
+For example:
+
+absolute name length difference
+relative name length difference
+Token overlap
+
+For example:
+
+intersection(tokens1, tokens2)
+/
+union(tokens1, tokens2)
+STEP 12 — Address Similarity Features
+
+Similarly calculate:
+
+Exact normalized address
+address_clean equality
+Address token overlap
+
+Compare:
+
+address_tokens
+Address-number overlap
+
+Compare:
+
+address_numbers
+Character similarity
+
+Calculate normalized string similarity.
+
+Address length difference
+
+Useful for distinguishing similar/dissimilar records.
+
+STEP 13 — Country Features
+
+Country should be an explicit feature.
+
+For each pair:
+
+country_equal
+
+Potentially:
+
+country missing on either side
+
+must also be represented.
+
+Do not assume only US and India.
+
+The test dataset includes France, so the feature logic must remain open-set.
+
+STEP 14 — Blocking-Strategy Features
+
+A particularly useful feature is:
+
+which blocking strategies produced this candidate?
+
+For example:
+
+name_exact_hit = 1
+name_prefix4_hit = 1
+address_token_hit = 1
+address_exact_hit = 0
+
+You can also create:
+
+num_blocking_strategies_matched
+
+A candidate retrieved through several independent blocking routes may provide useful evidence.
+
+This should be treated as a feature, not automatically as proof of a match.
+
+STEP 15 — Construct Training Examples
+
+The training ground truth allows us to construct supervised examples.
+
+Positive examples
+
+For every known true pair:
+
+S1 ↔ true S2/S3
+
+label:
+
+y = 1
+Negative examples
+
+For each S1, take candidates produced by blocking that are not in the ground truth.
+
+Label:
+
+y = 0
+
+This is much better than randomly selecting arbitrary records from the millions of entities because the negatives should resemble the records the model will actually encounter.
+
+STEP 16 — Handle Class Imbalance
+
+There will likely be far more negative candidate pairs than positive pairs.
+
+Therefore, inspect:
+
+positive count
+negative count
+positive/negative ratio
+
+Then use an appropriate strategy such as:
+
+controlled negative sampling
+class weighting
+both, if justified
+
+Do not simply train on an enormous negative set without checking its composition.
+
+STEP 17 — Split Training Data Correctly
+
+Avoid leakage.
+
+The same S1 entity can have multiple true matches.
+
+Therefore, train/validation splitting should be performed at the S1 entity level, not randomly at the individual pair level.
+
+For example:
+
+S1 entities
+   ├── training S1 entities
+   └── validation S1 entities
+
+Then all pairs associated with an S1 remain in the same split.
+
+This prevents information from the same S1 entity appearing in both train and validation.
+
+STEP 18 — Train a Matching Model
+
+The first matching model should preferably be relatively simple and interpretable.
+
+The feature set is likely tabular:
+
+name similarities
+address similarities
+country equality
+blocking indicators
+length features
+token features
+
+Suitable model families include:
+
+logistic regression
+gradient-boosted trees
+random forest-style models
+other tabular classifiers
+
+The first model should establish a reliable baseline before introducing unnecessary complexity.
+
+STEP 19 — Evaluate at the Correct Unit
+
+The challenge evaluates matching at the S1 entity level, not simply pair-level classification accuracy.
+
+Therefore, do not optimize only:
+
+pair accuracy
+
+You need to evaluate:
+
+For each S1:
+    predicted matched IDs
+    true matched IDs
+
+and calculate the challenge's F0.5-style metric appropriately.
+
+STEP 20 — Threshold Calibration
+
+The matcher will output a score/probability.
+
+For example:
+
+S1-100 → S2-123 : 0.97
+S1-100 → S2-456 : 0.81
+S1-100 → S3-789 : 0.12
+
+A threshold must be selected.
+
+But the threshold should not be chosen merely because it gives the highest pairwise accuracy.
+
+It should be calibrated against the challenge objective.
+
+Because the metric is F0.5, precision is weighted more heavily than recall.
+
+The thresholding process should therefore explicitly evaluate:
+
+precision
+recall
+F0.5
+
+at the S1-level evaluation.
+
+STEP 21 — Handle Zero-Match S1s
+
+This is particularly important.
+
+The ground truth contains:
+
+123,247
+
+S1 entities with zero matches.
+
+The model must therefore be allowed to predict:
+
+matched_entity_ids = ""
+
+when no candidate reaches the required confidence.
+
+Do not force every S1 to receive a match.
+
+STEP 22 — Handle Singleton Matches
+
+There are:
+
+119,157
+
+S1 entities with exactly one true match.
+
+For these, the system must distinguish the true candidate from false candidates.
+
+This is one of the areas where false positives can significantly hurt the final metric.
+
+STEP 23 — Handle Multiple Matches
+
+There are:
+
+1,964,417
+
+S1 entities with multiple matches.
+
+This means the matcher cannot simply perform:
+
+argmax(score)
+
+for every S1.
+
+Instead, multiple candidates may need to be retained.
+
+Conceptually:
+
+S1
+ ├── candidate A → score 0.97 → keep
+ ├── candidate B → score 0.95 → keep
+ ├── candidate C → score 0.21 → reject
+ └── candidate D → score 0.08 → reject
+
+The exact retention rule must be calibrated against the training ground truth.
+
+STEP 24 — Build Final Test Candidate Generation
+
+After the candidate generator has passed training validation:
+
+Process:
+
+processed/test/processed_test_source1.tsv
+processed/test/processed_test_source2.tsv
+processed/test/processed_test_source3.tsv
+
+using the finalized blocking system.
+
+Generate:
+
+output/candidate_pairs.tsv
+
+with exactly:
+
+source1_entity_id    candidate_entity_ids
+
+Each S1 must appear exactly once.
+
+STEP 25 — Candidate File Requirements
+
+For every test S1:
+
+source1_entity_id
+candidate_entity_ids
+
+If there are no candidates:
+
+S1-123
+<empty>
+
+If there are candidates:
+
+S1-123    S2-100,S2-500,S3-900
+
+Candidate IDs must be unique.
+
+And:
+
+final matched IDs ⊆ candidate IDs
+
+must hold.
+
+STEP 26 — Run the Matching Model on TEST
+
+For every candidate pair:
+
+S1
+  ↕
+candidate S2/S3
+
+calculate the same features used during training.
+
+Then:
+
+candidate pair
+      ↓
+trained model
+      ↓
+match score
+      ↓
+threshold/decision logic
+      ↓
+matched or rejected
+STEP 27 — Generate matching_results.tsv
+
+Create:
+
+output/matching_results.tsv
+
+with exactly:
+
+source1_entity_id    matched_entity_ids
+
+One row per test S1.
+
+For example:
+
+source1_entity_id    matched_entity_ids
+S1-001               S2-123,S3-456
+S1-002
+S1-003               S2-999
+
+The empty row is valid if the model determines that no candidate is sufficiently likely to be a match.
+
+STEP 28 — Verify Candidate/Match Consistency
+
+Before submission:
+
+For every S1:
+
+set(matched_entity_ids)
+    ⊆
+set(candidate_entity_ids)
+
+This should be checked programmatically.
+
+If a final match is not present in the candidate file, there is a pipeline bug.
+
+STEP 29 — Run Submission Validator
+
+Run:
+
+python dataset\utils\validate_submission.py `
+    --matching output\matching_results.tsv `
+    --candidate output\candidate_pairs.tsv `
+    --test-dir dataset\dataset\test
+
+Check:
+
+TSV format
+correct headers
+one row per S1
+no duplicate S1 IDs
+no duplicate matched IDs
+no self-matches
+correct S2/S3 ID prefixes
+correct test S1 coverage
+candidate/match relationship
+
+If needed, run the optional ID validation separately because it is memory-intensive.
+
+STEP 30 — Analyze Final Test Candidate Statistics
+
+Before packaging, record:
+
+Number of test S1 entities
+Total candidate pairs
+Average candidates/S1
+Median candidates/S1
+P95
+P99
+Maximum
+
+Also:
+
+S1 with zero candidates
+S1 with one candidate
+S1 with >100 candidates
+S1 with >500 candidates
+S1 with >1000 candidates
+
+This will identify pathological blocking behavior.
+
+STEP 31 — Analyze Matching Output
+
+Before submission, inspect:
+
+number of S1s with zero predicted matches
+number with one predicted match
+number with multiple predicted matches
+maximum predicted matches
+
+Compare this distribution with the training ground-truth distribution.
+
+This is diagnostic only — do not force the test distribution to match training.
+
+STEP 32 — Documentation
+
+Only after the pipeline is finalized should we complete:
+
+Documentation_template.md
+
+The documentation should contain:
+
+Executive Summary
+
+Problem and solution overview.
+
+Methodology
+
+Explain:
+
+preprocessing
+blocking
+candidate generation
+matching
+Candidate Generation
+
+Document:
+
+12 blocking strategies
+UNION design
+missing-value handling
+candidate deduplication
+Matching Model
+
+Document:
+
+features
+model
+training procedure
+negative sampling
+threshold
+Results
+
+Include actual measured:
+
+blocking recall
+candidate counts
+validation performance
+Error Analysis
+
+Document:
+
+blocking misses
+false positives
+false negatives
+difficult entity types
+STEP 33 — Final Submission Package
+
+The final package should ultimately look like:
 
 <team_name>_submission.zip
 │
@@ -73,1313 +1704,1497 @@ The final ZIP should follow the prescribed structure:
 │   └── business_entity_resolution/
 │       ├── src/
 │       │   ├── config.py
-│       │   ├── data_loader.py
 │       │   ├── preprocessing.py
 │       │   ├── blocking.py
-│       │   ├── features.py
-│       │   ├── train.py
-│       │   ├── evaluate.py
-│       │   ├── inference.py
-│       │   └── generate_submission.py
-│       │
+│       │   ├── candidate_generation.py
+│       │   ├── matching_features.py
+│       │   ├── matcher.py
+│       │   └── ...
 │       ├── README.md
 │       └── requirements.txt
 │
 └── Documentation_template.md
 
-The official submission specification requires the outputs, runnable source code, README, requirements, and methodology document.
+Do not include huge raw/processed datasets in the submission if the challenge specification does not require them.
 
-Goal of this phase
+Recommended Implementation Order
 
-Don't create a giant notebook and later try to turn it into a project.
+The order matters.
 
-Build the final architecture from the beginning.
+Phase A — Current stage
 
-PHASE 1: Load the datasets
+Already completed:
 
-Create:
+✅ EDA
+✅ preprocessing
+✅ ground-truth analysis
+✅ blocking
+✅ blocking recall
 
-src/data_loader.py
+Current baseline:
 
-Load:
+S2 = 98.1153%
+S3 = 97.6407%
+Overall ≈ 97.87%
+Phase B — Immediate next work
 
-dataset/train/
-    train_source1.tsv
-    train_source2.tsv
-    train_source3.tsv
-    train_ground_truth.tsv
+Implement these first:
 
-dataset/test/
-    test_source1.tsv
-    test_source2.tsv
-    test_source3.tsv
+1. blocking_miss_analysis.py
+2. blocking_candidate_analysis.py
 
-Use:
+Do not build the matcher yet.
 
-pd.read_csv(path, sep="\t")
+These answer:
 
-The challenge explicitly says all files are TSV and must be read using an explicit tab separator.
-
-Validate immediately
-
-Check:
-
-columns
-row count
-duplicate entity IDs
-nulls
-data types
-country values
-
-Expected record columns:
-
-entity_id
-business_name
-business_address
-country
-
-The source is identifiable from the S1/S2/S3 ID prefix and file.
-
-PHASE 2: Understand the training data
-
-Before doing ML, understand what we're dealing with.
-
-2.1 Source statistics
-
-For each source calculate:
-
-number of records
-number of unique businesses
-missing names
-missing addresses
-missing countries
-duplicate names
-duplicate addresses
-2.2 Country distribution
-
-Calculate:
-
-Source 1:
-US → ?
-India → ?
-
-Source 2:
-...
-
-Source 3:
-...
-
-Do not hard-code the countries.
-
-The official instructions specifically warn that training has US and India while the test additionally contains France. Country must therefore be treated as an open-set string field.
-
-2.3 Name analysis
-
-Inspect:
-
-name length
-number of words
-percentage containing punctuation
-percentage containing legal suffixes
-duplicate names
-very short names
-
-Examples:
-
-Acme Robotics Inc.
-Acme Robotics Incorporated
-Acme Robotics
-Acme Robotix
-2.4 Address analysis
-
-Inspect:
-
-address length
-number of tokens
-numeric components
-ZIP/PIN-like patterns
-common abbreviations
-missing addresses
-
-The challenge specifically expects address abbreviations, missing components, landmarks, transliteration and component reordering.
-
-PHASE 3: Parse the ground truth
-
-The ground truth has:
-
-source1_entity_id
-matched_entity_ids
-
-For example:
-
-S1-001    S2-101,S3-501
-S1-002    S2-102
-S1-003
-
-The empty list means the S1 entity is a singleton.
-
-Convert it internally into pair-level labels:
-
-S1-001 → S2-101 → 1
-S1-001 → S3-501 → 1
-S1-002 → S2-102 → 1
-
-This becomes the foundation of training.
-
-PHASE 4: Build the validation framework FIRST
-
-This is essential.
-
-We don't want to make a model and discover after submitting that our local evaluation is wrong.
-
-4.1 Split by Source 1 entity
-
-For example:
-
-80% S1 → training
-20% S1 → validation
-
-The split should be at the S1 level rather than randomly splitting pair rows.
-
-4.2 Implement competition metric
-
-Create:
-
-src/evaluate.py
-
-Implement:
-
-$$ F_{0.5} = \frac{1.25PR} {0.25P+R} $$
-
-But importantly, this is a macro F₀.₅ across Source 1 entities, not simply one global pair-level F₀.₅.
-
-For every S1:
-
-true matches
-predicted matches
-precision
-recall
-F0.5
+Why are 162,684 true pairs missed?
+How many candidates will the current blocking generate?
+Phase C — Finalize blocking
 
 Then:
 
-macro_F0.5 = mean(F0.5 across S1)
-PHASE 5: Explicit singleton evaluation
+3. Decide whether additional blocking is required
+4. Finalize the blocking strategy set
+5. Implement candidate_generation.py
+6. Generate training candidate pairs
+7. Verify candidate recall
+Phase D — Matching
 
-A singleton is:
+Then:
 
-S1 → no S2/S3 match
+8. matching_features.py
+9. Generate positive/negative training examples
+10. Train/validation split by S1
+11. Train baseline matcher
+12. Calibrate threshold
+13. Evaluate at S1 level using F0.5
+14. Improve model/features if necessary
+Phase E — Test inference
 
-Correct prediction:
+Then:
 
-[]
+15. Generate test candidate_pairs.tsv
+16. Generate test matching_results.tsv
+17. Verify matches ⊆ candidates
+18. Run submission validator
+Phase F — Finalization
 
-gets:
+Finally:
 
-F0.5 = 1
+19. Error analysis
+20. Documentation
+21. Clean repository
+22. Build submission ZIP
+23. Final validation
+Most Important Immediate Milestone
 
-Incorrect prediction:
+Your next milestone should not be the ML model.
 
-[S2-something]
+It should be:
 
-gets:
+                 CURRENT
+                    │
+                    ▼
+       97.87% blocking recall
+                    │
+                    ▼
+       ┌─────────────────────┐
+       │ Analyze 162,684      │
+       │ missed true pairs   │
+       └──────────┬──────────┘
+                  │
+                  ▼
+       ┌─────────────────────┐
+       │ Measure candidate   │
+       │ set sizes           │
+       └──────────┬──────────┘
+                  │
+                  ▼
+       ┌─────────────────────┐
+       │ Finalize blocking   │
+       └──────────┬──────────┘
+                  │
+                  ▼
+       ┌─────────────────────┐
+       │ Build candidate     │
+       │ generator           │
+       └──────────┬──────────┘
+                  │
+                  ▼
+       ┌─────────────────────┐
+       │ Validate candidate  │
+       │ recall on training  │
+       └──────────┬──────────┘
+                  │
+                  ▼
+             THEN MATCHING
 
-F0.5 = 0
+That sequence prevents us from building a sophisticated matcher on top of a candidate-generation system whose coverage and computational cost have not yet been fully characterized.
 
-The official challenge explicitly emphasizes this behavior.
 
-Therefore our evaluator should separately report:
 
-singleton_count
-correct_singletons
-singleton_accuracy
-false_singleton_merges
-PHASE 6: Build the preprocessing pipeline
+What did the miss analysis tell us?
 
-Create:
+This is actually very useful for deciding what to do next.
 
-src/preprocessing.py
+Names
 
-We should maintain multiple representations.
+Among the missed pairs:
 
-For names:
+0% have exact normalized name equality.
+0% have exact normalized name-without-suffix equality.
+75.61% have no shared name token.
+Therefore, a large portion of the misses involve substantial name corruption/transformation.
 
-business_name_raw
-business_name_normalized
-business_name_alphanumeric
-business_name_tokens
-business_name_sorted_tokens
-business_name_without_legal_suffix
+The feature distributions show that the name similarity is nevertheless sometimes very high.
 
-For addresses:
+For ALL misses:
 
-business_address_raw
-business_address_normalized
-business_address_alphanumeric
-business_address_tokens
-address_numbers
+Name feature	Median	P75	P90	P95
+Character similarity	0.129	0.604	0.792	0.857
+Token Jaccard	0	0	0.50	0.60
+Token intersection	0	0	3	3
 
-Don't overwrite the raw values.
+This means there are two different populations:
 
-PHASE 7: Business-name normalization
+relatively severe name transformations where token-based blocking fails
+records where the name is actually very similar but has character-level corruption
+Addresses are much more promising
 
-Normalize things like:
+This is the interesting result.
 
-uppercase → lowercase
-punctuation
-extra spaces
-ampersand / and
+Among all 162,684 misses:
 
-Handle legal suffix variations such as:
+65.21% have overlapping address numbers
+median address-token Jaccard = 0.357
+median address character similarity = 0.556
+P90 address character similarity = 0.841
+only 3.49% have no shared address token
 
-Inc
-Incorporated
-Corp
-Corporation
-Ltd
-Limited
-Pvt
-Private
-LLC
+So most blocking misses are not completely unrelated records.
 
-But preserve both:
+They often contain useful address information.
 
-raw name
-cleaned name
+The boolean summary shows:
 
-because aggressive cleaning can remove useful information.
+address_number_overlap = 65.21%
 
-The official noise patterns specifically mention abbreviations, legal suffixes, punctuation, word order and typos.
+and
 
-PHASE 8: Address normalization
+no_shared_address_token = 3.49%
 
-Create normalized versions of addresses.
+This strongly suggests that there may be useful additional blocking signals based on approximate/normalized address information, but we should not add such a block blindly yet.
 
-Handle obvious formatting differences:
+There is another important observation
 
-street → st
-road → rd
-avenue → ave
+All missed pairs have:
 
-Extract:
+country_same = 100%
 
-house/building number
-numeric tokens
-PIN/ZIP-like numbers
-tokens
+and
+
+country_missing_either = 0%
+
+So country mismatch is not responsible for these misses.
+
+That's good because it means our country-aware blocking is behaving as intended.
+
+Also, only:
+
+3.43% of missed pairs have a missing address.
+
+So missing addresses aren't the primary reason either.
+
+Step 2 — Candidate block-size analysis: NOT DONE YET
+
+This is the next step.
+
+Our roadmap was:
+
+1. Analyze 162,684 blocking misses              ← DONE
+2. Analyze candidate block sizes                 ← NEXT
+3. Decide whether additional blocking is needed
+4. Build candidate generator
+5. Validate candidate recall
+...
+
+So do not modify blocking.py yet.
+
+We first need to answer:
+
+How many candidate entities does each of our 12 blocking strategies actually generate for each S1 entity on the full dataset?
+
+This is critical because recall alone isn't enough.
+
+For example, name_prefix4 has:
+
+S2 individual recall ≈ 76.85%
+S3 individual recall ≈ 75.54%
+
+while address_token has:
+
+S2 ≈ 79.40%
+S3 ≈ 55.84%
+
+But a strategy can have good recall while producing enormous candidate sets.
+
+Our earlier 5,000-row smoke test suggested:
+
+Strategy	Sample max candidate count
+name_exact	3
+name_no_suffix_exact	4
+name_sorted_exact	3
+name_prefix4	28
+name_token	313
+address_exact	1
+address_numbers	168
+address_token	392
+composites	mostly ≤ 4
+
+But those were only sample results.
+
+We now need full-data statistics.
+
+5. What Step 2 should calculate
+
+For each of the 12 strategies, calculate candidate counts for every S1 entity:
+
+S1 entity
+    ↓
+blocking key
+    ↓
+all S2/S3 entities sharing that key
+    ↓
+candidate count
+
+And then calculate at least:
+
+number of S1 records
+number with zero candidates
+number with ≥1 candidate
+mean candidates
+median
+P75
+P90
+P95
+P99
+P99.9
+maximum
+total candidate pairs
+
+Most importantly, calculate this for the union of all 12 strategies.
+
+We need something like:
+
+UNION_ALL
+
+Total S1 entities: 2,206,821
+Total candidate pairs: ...
+Mean candidates/S1: ...
+Median: ...
+P95: ...
+P99: ...
+P99.9: ...
+Maximum: ...
+
+And preferably separately:
+
+S1 → S2 candidate counts
+S1 → S3 candidate counts
+S1 → S2+S3 candidate counts
+6. Why this must come before adding another block
+
+Our current union gives:
+
+97.87% true-pair blocking recall
+
+That leaves only:
+
+162,684 / 7,638,365 = 2.13%
+
+But adding a fuzzy block could potentially explode the candidate set.
+
+For example, suppose an additional approximate-address strategy recovered 50,000 missed pairs but generated 500 million additional candidate pairs.
+
+That may be unacceptable for the downstream pairwise matcher.
+
+Conversely, if we find a blocking rule that recovers a substantial portion of the 162,684 misses while adding only a few million candidates, that could be very useful.
+
+So we need the tradeoff:
+
+additional blocking recall
+        vs.
+additional candidate volume
+
+before changing the blocking architecture.
+
+7. One especially useful insight from your current results
+
+The miss analysis gives us a strong direction for the eventual investigation.
+
+Among the 162,684 misses:
+
+65.21% → share at least one address number
+96.51% → share at least one address token
+
+Actually, the second figure follows from:
+
+no_shared_address_token = 3.49%
+
+So address information is present in the overwhelming majority of misses.
+
+At the same time:
+
+75.61% → no shared name token
+
+This means simply creating another name-token block is unlikely to solve the entire miss population.
+
+The eventual additional blocking investigation should therefore examine things such as:
+
+normalized address token combinations
+address-number + locality combinations
+character-normalized address signatures
+robust combinations of partial address/name information
+
+But we should not implement any of these yet.
+
+
+
+
+
+. The biggest issue: UNION index construction
+
+The per-strategy analysis is good.
+
+This part:
+
+target_strategy_counts[strategy] = valid_keys.value_counts()
+
+followed by:
+
+counts = s1_keys.map(target_strategy_counts[strategy]).fillna(0).astype(int)
+
+is a good approach.
+
+It computes:
+
+block key → number of records
+
+rather than materializing candidate pairs.
+
+That is exactly what we want for the individual strategy statistics.
+
+But the UNION is different
+
+For UNION, the script does:
+
+idx = {}
+
+for eid, key in zip(target_df.index, keys_series):
+    if key != "":
+        if key not in idx:
+            idx[key] = []
+        idx[key].append(eid)
+
+and does this for all 12 strategies.
+
+Then for every one of the 2.2 million S1 records, it creates a Python set:
+
+candidates = set()
+
+and inserts every candidate ID from all 12 strategies.
+
+Why this matters
+
+Claude described this as memory-efficient, but this is only partially true.
+
+It avoids a Cartesian product, which is excellent.
+
+However, Python:
+
+dict
+  → list
+      → millions of Python strings
+
+for 12 indexes can consume a very large amount of RAM.
+
+Then it additionally constructs a set() for every S1.
+
+Your previous miss-analysis process reached roughly 26 GB private memory, so I would not casually run this UNION implementation without considering the machine's available RAM.
+
+2. The combined S2+S3 index is even more concerning
+
+This section:
+
+combined_indexes = {}
+
+for strategy, col in strategy_col_map.items():
+    idx = {}
+
+    for eid, key in zip(sources_data["S2"].index, source_keys["S2"][col]):
+        ...
+        idx[key].append(eid)
+
+    for eid, key in zip(sources_data["S3"].index, source_keys["S3"][col]):
+        ...
+        idx[key].append(eid)
+
+    combined_indexes[strategy] = idx
+
+creates another set of 12 dictionaries containing Python lists of entity IDs.
+
+That is potentially a substantial additional memory spike.
+
+3. There is also unnecessary duplication
+
+Earlier the script already has:
+
+target_strategy_counts
+
+which contains the block frequencies.
+
+Then for UNION it reconstructs the block → entity-ID indexes again.
+
+So there are effectively two representations:
+
+block → count
+
+and
+
+block → [entity_id, entity_id, ...]
+
+The second one is needed for exact UNION candidate IDs, but the first one is still retained until the function finishes.
+
+This isn't a correctness bug, but it isn't optimal memory management.
+
+4. The actual candidate counts are correct in principle
+
+The UNION logic itself is conceptually correct:
+
+candidates = set()
+
+for strategy:
+    candidates.update(
+        strategy_indexes[strategy].get(key, [])
+    )
+
+union_count = len(candidates)
+
+This correctly handles:
+
+name_prefix4 → S2-123
+name_token    → S2-123
+address_token → S2-123
+
+as:
+
+1 candidate
+
+rather than 3.
+
+So the algorithm is logically correct.
+
+The problem is primarily resource efficiency, not candidate-set correctness.
+
+5. Another minor issue: source_keys keeps all three reconstructed DataFrames
+
+The script loads:
+
+S1
+S2
+S3
+
+and then creates:
+
+source_keys["S1"]
+source_keys["S2"]
+source_keys["S3"]
+
+while also retaining:
+
+sources_data["S1"]
+sources_data["S2"]
+sources_data["S3"]
+
+So the original processed columns plus all reconstructed blocking-key columns remain resident.
+
+Given the dataset size, this is another avoidable memory cost.
+
+It's not necessarily fatal, but it contributes to the peak.
+
+6. The per-strategy volume calculation is correct
+
+This:
+
+total_pairs = source_keys["S1"][col].map(
+    source_keys[target_id][col].value_counts()
+).fillna(0).sum()
+
+is mathematically correct for:
+
+total number of S1→target candidate pairs generated by that strategy.
 
 For example:
 
-500 Market Street, San Jose
+S1-A → block X
+S2:
+    X → 10 records
 
-could yield:
+therefore S1-A contributes 10 candidate pairs
 
-normalized:
-500 market st san jose
+and summing across all S1 gives the total candidate-pair volume.
 
-numbers:
-500
+Good.
 
-tokens:
-500
-market
-st
-san
-jose
+7. One thing Claude did NOT implement from the prompt
 
-Again, retain the original.
+The prompt requested:
 
-PHASE 9: Do not use external information
+per-strategy unique contribution to the UNION, if practical.
 
-Everything must come from:
+The script explicitly chooses not to calculate this:
 
-training data
-test data
-provided files
+# Unique contribution is hard without the full pair list.
+# We will report the total candidate pairs per strategy.
 
-Do not use:
+That's acceptable because the prompt explicitly allowed a simplified version if the exact calculation was expensive.
 
-Google
-Google Maps
-OpenStreetMap
-business directories
-government databases
-geocoding APIs
-commercial entity APIs
-internet business information
+So this is not an error.
 
-The challenge explicitly prohibits external lookup, databases, APIs and geocoding.
+The output should simply be interpreted as:
 
-PHASE 10: Build blocking
+total_candidate_pairs
 
-This is the first major ML component.
+rather than:
 
-Create:
+unique_union_contribution
+8. The output example selection is fine
 
-src/blocking.py
+It takes the top 100 S1 entities by combined S2+S3 UNION candidate count:
 
-The challenge says blocking uses a cheap key involving name and address, with records entering the same block through similar names or shared addresses.
+top_s1 = s2_s3_union_counts.sort_values(ascending=False).head(100)
 
-The Acme example is especially important.
+This is useful for identifying pathological blocks.
 
-For:
+9. Distribution buckets are correct
 
-S1:
-Acme Robotics Inc.
-500 Market St, San Jose
+The buckets:
 
-the candidate block contains:
+0–1
+1–2
+2–5
+5–10
+10–25
+25–50
+50–100
+100–250
+250–500
+500–1000
+1000–5000
+5000+
 
-S2-118820
-Acme Robotics Inc.
-500 Market Street, San Jose
+are useful.
 
-S2-540221
-Acme Robotix
-12 Elm Rd, San Jose
+One subtlety: because the intervals are implemented as:
 
-S3-905477
-Acme Robotics
-Nr City Hall, San Jose
+counts >= low
+counts < high
 
-S3-063118
-Acme Bakery
-500 Market St, San Jose
-
-The first and third are likely true matches.
-
-The second and fourth are look-alikes.
-
-All four enter blocking.
-
-The matching model later removes the two false candidates.
-
-PHASE 11: Implement multiple blocking keys
-
-Don't rely on a single blocking rule.
-
-Block A: Exact normalized name
-name_normalized
-
-Example:
-
-acme robotics inc
-Block B: Name without legal suffix
-name_without_suffix
+the labels represent half-open intervals.
 
 So:
 
-Acme Robotics Inc.
-Acme Robotics Incorporated
+0-1
 
-can enter the same block.
+means exactly 0 candidates, while:
 
-Block C: Name tokens
+1-2
 
-Use informative tokens from:
+means exactly 1 candidate.
 
-Acme Robotics
+That's fine, although the labels could be clearer as [0,1), [1,2), etc.
 
-such as:
+Not a correctness issue.
 
-acme
-robotics
-Block D: Name prefix / character key
+10. Sanity checks could be stronger
 
-For typo robustness:
+The script currently only prints warnings if the source row counts differ:
 
-name_normalized[:4]
-name_normalized[:5]
+if len(...) != expected:
+    print("WARNING...")
 
-or character n-gram keys.
+rather than stopping.
 
-Block E: Address tokens
+I would prefer assertions:
 
-For:
+assert len(sources_data["S1"]) == S1_EXPECTED_COUNT
+assert len(sources_data["S2"]) == S2_EXPECTED_COUNT
+assert len(sources_data["S3"]) == S3_EXPECTED_COUNT
 
-500 Market Street San Jose
+But this isn't necessary if the files are already known to have the correct counts.
 
-use tokens such as:
+11. One thing I especially like
 
-500
-market
-san
-jose
-Block F: Numeric address key
+The script does not accidentally create:
 
-Use:
+S1 × S2
 
-house_number
+or:
 
-and other useful numeric components.
+S1 × S3
 
-This allows the S3 "Acme Bakery" look-alike in the official example to enter the Acme candidate set because the address is shared.
+The individual strategy calculation uses frequency maps, and the UNION uses block indexes.
 
-Block G: Name + address key
+That's fundamentally the right architecture.
 
-Construct a combined cheap key such as:
+My recommendation
+Do NOT run this exact version yet.
 
-name_prefix + address_token
+Not because it is mathematically wrong.
 
-This is closer to the blocking concept explicitly shown in the PPT.
+It is correct in logic, but the UNION implementation is unnecessarily memory-heavy for your dataset.
 
-PHASE 12: Union the blocking strategies
+The dangerous part is:
 
-This is extremely important.
+12 × (block_key → Python list of millions of entity-ID strings)
++
+2.2M per-S1 Python sets
++
+S1/S2/S3 processed DataFrames
++
+12 reconstructed key DataFrames
 
-We should do:
 
-name_candidates
-        UNION
-address_candidates
-        UNION
-name_address_candidates
-        UNION
-token_candidates
-        UNION
-numeric_candidates
+Given that your previous analysis already consumed high RAM, I would fix this before the full run.
 
-rather than requiring every condition simultaneously.
+What I want Claude to change
 
-Conceptually:
+The next version should retain the excellent per-strategy frequency-map approach but make the UNION computation chunked/memory-aware, rather than maintaining giant Python dict → list[string] indexes for all strategies simultaneously.
 
-                   S1
+Crucially:
+
+Do not change blocking.py.
+
+Do not change any of the 12 strategies.
+
+Do not run the script.
+
+Only modify blocking_candidate_analysis.py, run py_compile, and stop.
+
+If you want, I can give you the exact correction prompt for Claude to optimize this script safely without changing the analysis logic.
+
+
+
+
+
+
+1. Where we are right now
+
+I would divide the project into roughly 5 major stages:
+
+Stage	Status
+1. Data understanding + preprocessing	✅ Done
+2. Ground-truth / error analysis	✅ Done
+3. Candidate generation / retrieval	🟡 In progress
+4. Matching model	❌ Not started
+5. Test inference + submission + validation	❌ Not started
+
+So I would estimate the overall project at roughly 40–45% complete.
+
+That's not because we have little code. The important remaining work — especially candidate recall and matching — is still ahead.
+
+2. What has actually been implemented
+A. Dataset understanding
+
+Done.
+
+We established:
+
+Source 1 = canonical/reference
+Source 2 + Source 3 = noisy records
+One S1 can have 0, 1, or many matches
+Country is open-set
+France exists in test
+Matching output is per S1
+Candidate output is the exact candidate set fed to the matcher
+
+The challenge explicitly says that every S1 test entity needs a row and that candidate generation determines the comparison set before matching.
+
+3. Preprocessing — DONE
+
+We have a reasonably strong Unicode-safe preprocessing pipeline.
+
+It generates:
+
+country_clean
+name_clean
+name_no_legal_suffix
+name_tokens
+name_sorted_tokens
+address_clean
+address_numbers
+address_tokens
+address_sorted_tokens
+
+It handles things such as:
+
+Unicode normalization
+case folding
+punctuation
+& → and
+@ → at
+legal suffixes
+address normalization
+numbers
+tokens
+country normalization
+
+And it has already been run on the complete train/test data.
+
+So we don't need to touch preprocessing right now.
+
+4. EDA — DONE
+
+We analyzed the complete training data.
+
+Training:
+
+S1 = 2,206,821
+S2 = 5,034,616
+S3 = 5,285,603
+
+Total:
+
+12,527,040 records
+
+Ground truth:
+
+7,638,365 true S1 → S2/S3 pairs
+
+And we established the very important distribution:
+
+0 matches     123,247
+1 match       119,157
+2 matches     375,212
+3 matches     530,841
+4 matches     484,115
+...
+11 matches         37
+
+Therefore this is not a simple one-to-one entity matching problem.
+
+5. Old blocking system — DONE AS BASELINE
+
+We implemented the original 12-rule blocking system:
+
+name_exact
+name_no_suffix_exact
+name_sorted_exact
+name_prefix4
+name_token
+address_exact
+address_numbers
+address_token
+name_address_exact
+name_no_suffix_address
+name_no_suffix_address_numbers
+name_prefix4_address_number
+
+We then evaluated it against all 7,638,365 ground-truth pairs.
+
+Result:
+
+S2 recall = 98.1153%
+S3 recall = 97.6407%
+
+Overall ≈ 97.87%
+
+Missed:
+
+162,684 true pairs
+
+This analysis was useful because we now know what the old rules fail on.
+
+6. The 162,684 missed pairs — VERY IMPORTANT
+
+We analyzed them.
+
+The important findings were:
+
+162,684 total missed pairs
+
+S2: 69,615
+S3: 93,069
+
+They survived none of the 12 old blocking rules.
+
+For example:
+
+exact normalized name → 0%
+exact no-suffix name → 0%
+~75.6% had no shared name token
+~65.2% still had overlapping address numbers
+median address-token Jaccard ≈ 0.357
+median address character similarity ≈ 0.556
+P90 address character similarity ≈ 0.841
+same country = 100%
+
+This is actually excellent information for designing the next retrieval layer.
+
+It tells us:
+
+The remaining pairs are not simply "another exact blocking rule" problem.
+
+They need soft lexical retrieval.
+
+7. New retrieval architecture — IN PROGRESS
+
+We decided to abandon the handcrafted 12-rule system as the main candidate generator.
+
+New architecture:
+
+                 S1 query
                     │
        ┌────────────┼────────────┐
+       │            │            │
        ▼            ▼            ▼
-     NAME        ADDRESS      COMBINED
-     BLOCK        BLOCK         BLOCK
+  Exact index   Token index   Character n-gram
        │            │            │
        └────────────┼────────────┘
                     ▼
-                  UNION
+             candidate union
                     │
                     ▼
-             Candidate pairs
+              final candidates
+                    │
+                    ▼
+                 matcher
 
-Why?
+This is much more promising.
 
-Because blocking is supposed to favor recall. Amazon explicitly says that the block intentionally pulls in look-alikes.
+8. Exact retrieval — DONE
 
-PHASE 13: Measure blocking recall
+Implemented:
 
-This is the most important blocking metric.
+exact_index.py
 
-For validation:
+It indexes:
 
-Total true pairs
+name_exact
+name_no_suffix_exact
+address_exact
+name_address_exact
 
-versus:
+with country partitioning.
 
-True pairs present in candidate set
+Full-data benchmark:
 
-Calculate:
+True pairs:       7,638,365
+Recovered:        3,317,869
+Recall:               43.44%
 
-$$ BlockingRecall = \frac{\text{True pairs inside candidate set}} {\text{Total true pairs}} $$
+Candidates:
+61,908,180
 
-For example:
+So exact retrieval alone is nowhere near sufficient.
 
-10,000 true matches
-9,850 retrieved by blocking
+But it is cheap and useful.
 
-Blocking recall = 98.5%
-Rule:
+9. Token retrieval — IMPLEMENTED BUT NOT FINISHED
 
-If blocking recall is poor:
+Implemented:
 
-DO NOT improve the matching model yet.
+token_index.py
 
-Fix blocking first.
+It indexes:
 
-Amazon explicitly says blocking sets the recall ceiling.
+name tokens
+address tokens
 
-PHASE 14: Control candidate explosion
+with:
 
-There is a trade-off.
+country partitioning
+document frequency
+IDF
+top-k token selection
+maximum document frequency
+candidate cap
 
-If a token like:
+The initial benchmark on 50,000 S1 records gave:
 
-"the"
+Token only
+True pairs = 173,221
 
-appears in 100,000 records, using it as a block produces a disaster.
+Recovered = 155,727
+
+Recall = 89.9008%
+
+Candidates = 17,489,275
+Mean ≈ 350/S1
+Exact + Token
+Recovered = 160,985
+
+Recall = 92.9362%
+
+Candidates = 18,665,262
+Mean ≈ 373/S1
+
+This is encouraging.
+
+But there are two problems:
+
+50K is only ~2.27% of the 2.2M S1 training records.
+The implementation is too slow.
+
+Therefore we are currently refactoring token_index.py.
+
+10. The biggest misconception to correct
+
+You said:
+
+"We left approx 162k data earlier. Is it included in retrieval method?"
+
+Answer: Not necessarily — and we have not measured it yet.
+
+The 162,684 are:
+
+pairs missed by the old 12-rule blocking system.
+
+The new token retrieval does not start from those 162,684 pairs.
+
+It searches the S2/S3 indexes independently.
 
 Therefore:
 
-if block_size > MAX_BLOCK_SIZE:
-    don't use that key
+Old blocking misses
+        ↓
+      162,684
+        ↓
+     Token retrieval
+        ↓
+some may be recovered
 
-or use more specific keys.
+Some could be recovered by token retrieval.
+
+Some could be recovered by character n-grams.
+
+Some could require another retrieval mechanism.
+
+And some may remain unrecovered.
+
+We do not know the number yet.
+
+11. Your concern about 99% recall is correct — but premature
+
+You said:
+
+"If 162k data has been left, recall will be max 98% so no way overall score will be 0.99."
+
+This would be true only if we decided to keep the old blocker as the final candidate generator.
+
+We haven't.
+
+The old system gives:
+
+97.87% pair recall
+
+Therefore if we permanently used it:
+
+Maximum candidate recall ≈ 97.87%
+
+and any true match outside candidates would be impossible for the matcher to recover.
+
+But our new retrieval system can potentially recover some or all of those old misses.
+
+So the actual target is:
+
+Old blocking
+       ↓
+97.87%
+
+        + new retrieval
+       ↓
+???%
+
+        + n-gram retrieval
+       ↓
+???%
+
+        + potentially another retrieval layer
+       ↓
+TARGET
+
+We don't know that final number yet.
+
+12. And 50K recall cannot be treated as full-data recall
+
+This is the second major issue you correctly identified.
+
+We currently know:
+
+50K token retrieval recall = 89.9008%
+50K exact + token = 92.9362%
+
+But we cannot say:
+
+"Our full dataset recall will be 92.94%."
+
+The 50K sample is just an initial benchmark.
+
+The correct next experiment is:
+
+Full training-data candidate recall
+
+We need to run:
+
+2,206,821 S1
+        ×
+S2 + S3 indexes
+        ↓
+candidate retrieval
+        ↓
+compare against
+7,638,365 ground-truth pairs
+
+Then calculate:
+
+overall pair recall
+S2 pair recall
+S3 pair recall
+per-S1 recall distribution
+zero-recall S1 count
+1.0-recall S1 count
+...
+
+That number becomes our real candidate-generation ceiling.
+
+13. But don't immediately run the current implementation on 2.2M
+
+This is critical.
+
+The current token implementation took:
+
+50K queries ≈ 441 seconds
+
+That's about:
+
+~113 S1/sec
+
+At 2.2M S1:
+
+roughly 5.4 hours for token-only querying.
+
+And the current implementation also has unnecessary candidate-volume overhead.
+
+So we should not simply launch the full benchmark now.
+
+First optimize.
+
+14. What we should do next
+
+I recommend this exact sequence.
+
+STEP 1 — Refactor token retrieval
+
+Modify only:
+
+retrieval/token_index.py
+
+Goals:
+
+Instead of:
+dict[token] -> list[str entity_id]
+
+use:
+
+dict[token] -> integer row positions
 
 For example:
 
-bad:
-common_token
+token "mumbai"
 
-better:
-common_token + address_token
+→ [182, 771, 1432, 9912, ...]
 
-We want:
+instead of:
 
-HIGH BLOCKING RECALL
-+
-LOW CANDIDATE VOLUME
-PHASE 15: Generate training candidate pairs
+→ ["S2-123...", "S2-456...", ...]
 
-After blocking:
+This reduces Python object/string overhead substantially.
 
-S1
- ↓
-candidate S2/S3 records
+15. Also precompute IDF
 
-construct:
+Currently IDF computation is happening too close to the query path.
 
-s1_id
-candidate_id
-label
+We should calculate:
 
-Example:
+idf(token)
 
-S1-001 S2-100 1
-S1-001 S2-101 0
-S1-001 S3-200 1
-S1-001 S3-201 0
+once during index construction.
 
-Positive pairs come from ground truth.
+Then query-time retrieval becomes essentially:
 
-Candidate pairs not in ground truth become negatives.
+query tokens
+      ↓
+select useful tokens
+      ↓
+retrieve posting lists
+      ↓
+accumulate scores
+      ↓
+Top-K
+16. Do not retrieve 200 name + 200 address independently forever
 
-PHASE 16: Generate hard negatives
+This is causing the candidate explosion.
+
+Currently:
+
+name retrieval → max 200
+address retrieval → max 200
+
+Therefore:
+
+union ≈ up to 400
+
+and we observed:
+
+median ≈ 397
+
+That's way too large for a matcher over millions of S1 records.
+
+Instead, eventually we want something more like:
+
+retrieve top candidates from each family
+             ↓
+merge
+             ↓
+score/rank
+             ↓
+retain final K
+
+For example:
+
+K_final = 100 / 150 / 200
+
+But we shouldn't choose that number blindly. We'll benchmark candidate recall versus candidate volume.
+
+17. Then run the ENTIRE training dataset
+
+This is the experiment we are missing.
+
+We should produce a table like:
+
+Retrieval	Pair recall	Mean candidates	P95	P99
+Exact	43.44%	28	137	525
+Token	???	???	???	???
+Exact + Token	???	???	???	???
+N-gram name	???	???	???	???
+N-gram address	???	???	???	???
+All lexical retrieval	???	???	???	???
+
+Only after this table do we know whether our candidate-generation architecture is viable.
+
+18. Then specifically investigate the remaining misses
+
+Suppose full-data exact + token gives us, hypothetically:
+
+96%
+
+Then:
+
+7,638,365 × 4%
+≈ 305,000 missed pairs
+
+We analyze those.
+
+The question becomes:
+
+What information exists in those missed pairs that token retrieval cannot retrieve?
+
+That's where character n-grams become useful.
+
+For example:
+
+Source 1:
+"Shree Balaji Enterprises"
+
+Source 2:
+"Shri Balaji Enterprses"
+
+Token overlap may be weak or absent because of spelling corruption.
+
+Character n-grams can retrieve:
+
+shree
+hree
+ree b
+ee ba
+...
+
+Similarly for addresses:
+
+"12 MG Road, Mumbai"
+
+"12 Mahatma Gandhi Rd Mumbai"
+
+Character-level retrieval can recover candidates even when tokenization differs.
+
+19. Then evaluate n-gram retrieval
+
+We'll build:
+
+ngram_index.py
+
+Likely:
+
+name character n-grams
+address character n-grams
+
+with:
+
+country partitioning
+frequency filtering
+sparse inverted index
+top-K retrieval
+
+Again:
+
+No embeddings yet.
+
+First see how far lexical retrieval can take us.
+
+20. If lexical retrieval still doesn't reach the required ceiling
+
+Then we add another retrieval family.
+
+Possibilities:
+
+character n-gram TF-IDF
+        +
+token TF-IDF
+        +
+exact
+        +
+possibly phonetic/variant retrieval
+
+But we should decide based on actual miss analysis rather than guessing.
+
+The challenge itself specifically suggests string similarity methods such as Jaccard, Levenshtein and TF-IDF cosine, and says candidate generation determines the upper bound of recall.
+
+21. Only after candidate recall is sufficiently high do we build the matcher
 
 This is important.
 
-The Acme example tells us what kind of negatives we want:
+Suppose:
 
-Type 1
-very similar name
-different address
-Type 2
-same address
-different business
-Type 3
-similar name + similar location
-but different business
+candidate recall = 99.5%
 
-These are much more informative than random negatives.
+Then the matcher can potentially achieve very high performance.
 
-The blocking stage naturally generates many of these hard negatives.
+But suppose:
 
-PHASE 17: Pairwise feature engineering
+candidate recall = 96%
 
-Create:
+Then no matcher can recover the 4% of true pairs that never enter its candidate set.
 
-src/features.py
+That's why matcher development now would be premature.
 
-For every candidate pair:
+22. But 99% candidate recall does NOT mean 99% F0.5
 
-S1 record
-+
-S2/S3 record
+This distinction is also important.
 
-generate features.
+The challenge evaluates:
 
-PHASE 18: Name features
+F0.5
 
-Use:
+per S1 and then macro-averages across S1 entities.
 
-Exact match
-name_exact
-Normalized exact match
-name_normalized_exact
-Levenshtein similarity
-name_levenshtein
-Jaro-Winkler
-name_jaro
-Token Jaccard
-$$ J(A,B)=\frac{|A\cap B|} {|A\cup B|} $$
-Token overlap
-intersection / min(token_count_A, token_count_B)
-TF-IDF cosine
+And it is precision-heavy.
 
-Use character and/or word n-grams.
+Therefore:
 
-The official challenge itself recommends Jaccard, Levenshtein and TF-IDF cosine similarity.
-
-PHASE 19: Address features
-
-Calculate:
-
-address_levenshtein
-address_jaro
-address_jaccard
-address_tfidf_cosine
-
-Plus:
-
-numeric_token_overlap
-house_number_match
-zip_match
-shared_token_count
-PHASE 20: Cross features
-
-Add:
-
-country_match
-name_address_joint_score
-name_token_overlap
-address_token_overlap
-
-For example:
-
-name_similarity = 0.95
-address_similarity = 0.92
-country_match = 1
-
-should be very strong.
-
-While:
-
-name_similarity = 0.95
-address_similarity = 0.08
-
-should be treated differently.
-
-PHASE 21: Source-pair features
-
-Add:
-
-source_pair = S1-S2
-
-versus:
-
-source_pair = S1-S3
-
-because the two vendor sources may have different formatting conventions.
-
-The challenge describes Sources 2 and 3 as different vendor representations.
-
-PHASE 22: First matching model
-
-Now train the actual matching classifier.
-
-Input:
-
-candidate pair
-        ↓
-engineered features
-
-Output:
-
-P(same_business)
-
-Start with a gradient-boosted tree model such as:
-
-LightGBM
-
-or another appropriately licensed tabular model.
-
-Do not start with an 8B LLM.
-
-The challenge is fundamentally a structured pairwise matching problem, and the official material does not require an LLM. The model-license constraint also applies to the final model.
-
-PHASE 23: Train the model
-
-Training data:
-
-candidate pair
-        │
-        ▼
-features
-        │
-        ▼
-label
-0 / 1
-
-Train:
-
-LightGBM
-
-and save:
-
-models/matcher.pkl
-
-or the appropriate model file.
-
-PHASE 24: Evaluate pair classifier
-
-Initially calculate:
-
-ROC-AUC
-PR-AUC
-precision
-recall
-
-But remember:
-
-These are NOT our final competition objective.
-
-The actual objective is:
-
-macro F0.5 at the S1 level
-
-So ultimately the threshold must be selected using the competition evaluator.
-
-PHASE 25: Threshold optimization
-
-Suppose the model generates:
-
-S1-A ↔ S2-X → 0.997
-S1-A ↔ S2-Y → 0.812
-S1-A ↔ S3-Z → 0.976
-S1-A ↔ S3-Q → 0.214
-
-Don't automatically use:
-
-threshold = 0.5
-
-Test:
-
-0.50
-0.55
-0.60
-...
-0.90
-0.92
-0.94
-0.96
-0.98
-
-For each:
-
-Generate complete S1 predictions
-        ↓
-Calculate macro F0.5
-
-Choose the threshold giving the best validation F₀.₅.
-
-PHASE 26: Consider separate S2/S3 thresholds
-
-After the baseline, test:
-
-threshold_S2
-threshold_S3
-
-because the two sources may have different noise patterns.
-
-But this is an experiment, not something we should assume beforehand.
-
-Only keep it if validation improves.
-
-PHASE 27: Multiple matches
-
-For every S1:
-
-matches = [
-    candidate
-    for candidate in candidates
-    if probability >= threshold
-]
-
-Do not select only the highest-scoring candidate.
-
-The challenge explicitly allows:
-
-zero matches
-one match
-many matches
-
-for a Source 1 entity.
-
-PHASE 28: Singleton handling
-
-For every S1 calculate:
-
-maximum candidate probability
-second-highest probability
-number of candidates above threshold
-
-If none pass the final threshold:
-
-matched_entity_ids = ""
-
-This is a legitimate prediction, not a failure.
-
-Correctly identifying a singleton earns full per-entity score.
-
-PHASE 29: Error analysis
-
-After the first model, don't immediately try another model.
-
-Inspect:
-
-False positives
-
-Examples:
-
-same name
-different address
-
-same address
-different name
-
-similar name
-similar address
-but different entity
-False negatives
-
-Examples:
-
-heavy typo
-partial address
-landmark address
-word reordering
-abbreviation
-transliteration
-
-Then modify:
-
-blocking
-features
-normalization
-threshold
-
-based on observed errors.
-
-PHASE 30: Final blocking pipeline
-
-Once we have the best blocking configuration, run it on the test set.
-
-For every:
-
-test_source1
-
-generate candidates from:
-
-test_source2
-test_source3
-
-Then save:
-
-output/candidate_pairs.tsv
-
-The file should contain the final candidate set that is actually fed into the matching model.
-
-PHASE 31: Final inference
-
-Pipeline:
-
-test S1
-   ↓
-preprocessing
-   ↓
-blocking
-   ↓
-candidate pairs
-   ↓
-feature generation
-   ↓
-trained matcher
-   ↓
-probabilities
-   ↓
-threshold
-   ↓
-matches
-PHASE 32: Generate matching_results.tsv
-
-Final structure:
-
-source1_entity_id    matched_entity_ids
-
-Example:
-
-S1-732914    S2-118820,S3-905477
-S1-889301    S2-397155,S3-651230
-S1-410562    S2-663049
-S1-205774
-
-Every S1 must have exactly one row.
-
-Empty means no matches.
-
-No duplicate IDs.
-
-Only S2/S3 IDs.
-
-The official specification is strict about these requirements.
-
-PHASE 33: Check candidate-subset consistency
-
-For every final match:
-
-matched ID ∈ candidate IDs
-
-For example:
-
-candidate:
-S1-001 → S2-A,S2-B,S3-C
-
-then final can be:
-
-S1-001 → S2-A,S3-C
-
-but never:
-
-S1-001 → S2-X
-
-because S2-X was never evaluated by the model.
-
-The challenge explicitly requires final matches to be a subset of the candidate set.
-
-PHASE 34: Run official validator
-
-Before every submission:
-
-python3 utils/validate_submission.py \
-    --matching output/matching_results.tsv \
-    --candidate output/candidate_pairs.tsv \
-    --test-dir dataset/test
-
-This checks the structural requirements.
-
-PHASE 35: Submit matching_results.tsv
-
-During the challenge:
-
-Portal
-  ↓
-matching_results.tsv
-
-This is the only file used for leaderboard scoring.
-
-PHASE 36: Maintain experiment history
-
-Since there are only 5 submissions per day, don't randomly burn submissions.
-
-Create:
-
-experiments.csv
-
-with:
-
-Exp	Blocking	Features	Model	Threshold	Local F₀.₅	Public Score	Notes
-1	baseline	basic	LightGBM	.90	...	...	baseline
-2	+address	basic	LightGBM	.90	...	...	...
-3	+char block	full	LightGBM	.92	...	...	...
-
-This prevents us from wandering around the forest with a compass made of spaghetti.
-
-PHASE 37: Submission experiments
-
-A sensible progression:
-
-Submission 1
-
-Basic:
-
-normalization
-+
-name/address blocking
-+
-similarity features
-+
-simple matcher
-
-Purpose: establish baseline.
-
-Submission 2
-
-Improve blocking recall.
-
-Submission 3
-
-Improve pairwise model/features.
-
-Submission 4
-
-Optimize F₀.₅ threshold/singletons.
-
-Submission 5
-
-Best locally validated configuration.
-
-Then use the next day for targeted improvements.
-
-PHASE 38: Build the final README
-
-The README should explain:
-
-1. Environment setup
-2. Dataset location
-3. Training command
-4. Inference command
-5. Output generation
-6. Validation command
-
-For example:
-
-pip install -r requirements.txt
-
-python src/train.py
-
-python src/inference.py
-
-python src/generate_submission.py
-
-The official submission requires a self-contained reproducible pipeline.
-
-PHASE 39: requirements.txt
-
-Pin the exact versions used.
-
-For example:
-
-pandas==...
-numpy==...
-scikit-learn==...
-lightgbm==...
-rapidfuzz==...
-scipy==...
-joblib==...
-
-Only include libraries actually used.
-
-PHASE 40: Documentation
-
-Fill:
-
-Documentation_template.md
-
-with:
-
-1. Methodology
-
-Explain the entire pipeline.
-
-2. Candidate generation / blocking
-
-Explain:
-
-name blocks
-address blocks
-combined blocks
-union
 candidate recall
-3. Model architecture
+       ≠
+final recall
+       ≠
+final F0.5
 
-Explain:
+We need:
 
-pair construction
-features
-classifier
-threshold
-singleton handling
-4. Experiments
+High candidate recall
+        +
+High matcher precision
+        +
+good singleton handling
+        +
+good multi-match handling
+23. In fact, our candidate generator should probably be more generous than the final matcher
 
-Document:
+Because:
 
-baseline
-blocking improvements
-feature improvements
-model experiments
-threshold experiments
-5. Final results
+Candidate generator:
+    optimize recall
 
-Include:
+Matcher:
+    optimize precision
 
-validation F0.5
-blocking recall
-model configuration
-final submission score
+That's especially important here because false merges are penalized heavily.
 
-The official guidelines specifically ask for methodology, blocking strategy, model architecture/feature engineering and relevant approach details.
+The challenge explicitly states that F0.5 weights precision more heavily and that incorrectly matching a singleton scores 0 for that S1.
 
-The most important design decision
+So we should not make the candidate set too aggressively small just to make matching fast.
 
-I want us to maintain this distinction throughout the project:
+24. Our actual roadmap now
 
-Blocking
-Question:
+Here is the revised roadmap I recommend:
 
-"Should this pair be considered?"
+                    CURRENT
+                       │
+                       ▼
+             ┌──────────────────┐
+             │ Preprocessing     │ ✅
+             └────────┬─────────┘
+                      ▼
+             ┌──────────────────┐
+             │ EDA + GT analysis│ ✅
+             └────────┬─────────┘
+                      ▼
+             ┌──────────────────┐
+             │ Old blocking      │ ✅
+             │ 97.87% recall     │
+             └────────┬─────────┘
+                      ▼
+             ┌──────────────────┐
+             │ Exact retrieval   │ ✅
+             │ 43.44% recall     │
+             └────────┬─────────┘
+                      ▼
+             ┌──────────────────┐
+             │ Token retrieval   │ 🟡
+             │ 50K tested        │
+             └────────┬─────────┘
+                      ▼
+             ┌──────────────────┐
+             │ Optimize token   │ ◀── WE ARE HERE
+             └────────┬─────────┘
+                      ▼
+             ┌──────────────────┐
+             │ FULL 2.2M TEST    │
+             │ candidate recall  │
+             └────────┬─────────┘
+                      ▼
+             ┌──────────────────┐
+             │ Token miss        │
+             │ analysis          │
+             └────────┬─────────┘
+                      ▼
+             ┌──────────────────┐
+             │ Character n-gram │
+             └────────┬─────────┘
+                      ▼
+             ┌──────────────────┐
+             │ Combined lexical │
+             │ retrieval         │
+             └────────┬─────────┘
+                      ▼
+             ┌──────────────────┐
+             │ FULL recall      │
+             │ measurement      │
+             └────────┬─────────┘
+                      ▼
+             ┌──────────────────┐
+             │ Candidate output │
+             └────────┬─────────┘
+                      ▼
+             ┌──────────────────┐
+             │ Matching model   │
+             └────────┬─────────┘
+                      ▼
+             ┌──────────────────┐
+             │ Validation       │
+             └────────┬─────────┘
+                      ▼
+             ┌──────────────────┐
+             │ Test inference   │
+             └────────┬─────────┘
+                      ▼
+             ┌──────────────────┐
+             │ Submission       │
+             └──────────────────┘
+25. Current completion estimate
 
-Goal:
+I'd track it like this:
 
-High recall
+Component	Completion
+Data understanding	100%
+Preprocessing	100%
+EDA	100%
+Ground-truth analysis	100%
+Old blocking baseline	100%
+Old blocking miss analysis	100%
+Exact retrieval	100%
+Token retrieval	~70%
+Full retrieval evaluation	0%
+N-gram retrieval	0%
+Final candidate generator	0%
+Matcher	0%
+Validation pipeline	~20%
+Test inference	0%
+Submission packaging	0%
 
-Accept:
+Overall:
 
-true matches
-+
-look-alikes
-+
-some garbage
-Matching model
-Question:
+~40–45% complete
 
-"Are these actually the same business?"
+The challenge's final deliverables are matching_results.tsv and candidate_pairs.tsv, with the latter being the exact candidate set actually fed to the matcher.
 
-Goal:
+26. What I would NOT do
 
-High precision
+At this point, I would not:
 
-Reject:
+abandon token retrieval
+immediately jump to embeddings
+train an XGBoost matcher
+generate test candidates
+assume 92.94% is the final recall
+assume the 162,684 old misses remain missed
+run the current slow token implementation over 2.2M S1
+tune matcher thresholds yet
 
-similar name / wrong address
-shared address / wrong business
-Final implementation roadmap
-STEP 01
-Create project structure
-        ↓
-STEP 02
-Load TSVs
-        ↓
-STEP 03
-EDA
-        ↓
-STEP 04
-Parse ground truth
-        ↓
-STEP 05
-Build S1-level validation split
-        ↓
-STEP 06
-Implement macro F0.5 evaluator
-        ↓
-STEP 07
-Implement name normalization
-        ↓
-STEP 08
-Implement address normalization
-        ↓
-STEP 09
-Build name blocking
-        ↓
-STEP 10
-Build address blocking
-        ↓
-STEP 11
-Build combined blocking
-        ↓
-STEP 12
-Union candidate sets
-        ↓
-STEP 13
-Measure blocking recall
-        ↓
-STEP 14
-Generate positive/negative pairs
-        ↓
-STEP 15
-Generate hard negatives
-        ↓
-STEP 16
-Build pairwise features
-        ↓
-STEP 17
-Train matching model
-        ↓
-STEP 18
-Evaluate model
-        ↓
-STEP 19
-Tune threshold for macro F0.5
-        ↓
-STEP 20
-Optimize singleton handling
-        ↓
-STEP 21
-Error analysis
-        ↓
-STEP 22
-Improve blocking/features
-        ↓
-STEP 23
-Run test inference
-        ↓
-STEP 24
-Generate candidate_pairs.tsv
-        ↓
-STEP 25
-Generate matching_results.tsv
-        ↓
-STEP 26
-Run official validator
-        ↓
-STEP 27
-Submit
-        ↓
-STEP 28
-Record leaderboard result
-        ↓
-STEP 29
-Controlled experiments
-        ↓
-STEP 30
-Finalize model
-        ↓
-STEP 31
-README + requirements
-        ↓
-STEP 32
-Documentation
-        ↓
-STEP 33
-Final ZIP
-The three stages we should optimize in order
+All of those would be premature.
 
-1. Blocking recall
+27. The immediate objective
 
-Did we find the true match among the candidates?
+We need to answer one question first:
 
-2. Matching precision
+How much of the 7,638,365 ground-truth pairs can an optimized retrieval system recover when evaluated against ALL 2,206,821 training S1 records?
 
-Can the model remove the look-alikes?
+Not 50K.
 
-3. Macro F₀.₅
+Not a sample.
 
-Does the complete S1-level prediction perform well under the actual competition metric?
+All 2.2M.
 
-That ordering follows the challenge's own explanation: blocking determines the recall ceiling, the matching model filters candidates, and the final submission is evaluated using precision-weighted macro F₀.₅.
+Once we have that, we will know whether we're at:
 
-One final principle: we should not start coding the sophisticated matcher until we have actually measured blocking recall on the training validation split. If the correct pair never enters the block, no amount of model wizardry can resurrect it. That's the central engineering constraint of this challenge.
+94%
+97%
+98%
+99%
+99.5%
+99.9%
 
-Our planned architecture is:
-                 RAW TSV
-                    │
-                    ▼
-              pandas
-                    │
-                    ▼
-            Normalization
-             pandas + Python
-                    │
-                    ▼
-               Blocking
-          pandas + dictionaries
-                    │
-                    ▼
-            Candidate pairs
-                    │
-                    ▼
-          Similarity features
-        ┌───────────┴───────────┐
-        │                       │
-    rapidfuzz              scikit-learn
-        │                       │
- Levenshtein             TF-IDF cosine
- Jaro-Winkler            Jaccard etc.
-        │                       │
-        └───────────┬───────────┘
-                    ▼
-             XGBoost model
-                    │
-                    ▼
-            Match probability
-                    │
-                    ▼
-          Threshold / singleton
-                    │
-                    ▼
-        matching_results.tsv
+or somewhere else.
 
+And only then can we intelligently decide whether n-grams, additional retrieval, or another technique is necessary.
 
+Most important conclusion
+
+Your concern is valid, but the 162,684 figure is not a permanent 2.13% loss. It is only the loss of the old blocking system.
+
+Our new retrieval architecture has not yet been evaluated against those misses, and the 50K token benchmark does not establish full-dataset recall.
+
+So our next milestone should be:
+
+Optimize token retrieval → run exact+token on all 2.2M S1 → measure full-data pair recall + per-S1 recall → analyze the remaining misses → add character n-gram retrieval → repeat.
+
+That will give us an evidence-based path toward a candidate-recall ceiling high enough for the final F0.5 optimization.
