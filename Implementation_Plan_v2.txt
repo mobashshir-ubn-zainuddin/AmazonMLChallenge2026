@@ -1,0 +1,336 @@
+AMAZON ML CHALLENGE 2026 — BUSINESS ENTITY RESOLUTION
+IMPLEMENTATION PLAN v2  (diagnosis of current approach + better step-wise plan)
+Written: 2026-09-26   Branch: mobashshir   Baseline commit: aa2292d
+
+======================================================================
+0. TL;DR
+======================================================================
+- The current pipeline searches the wrong way: S1 -> S2/S3, taking the top 200 by name
+  plus the top 200 by address. That gives about 374 candidates per S1 (~825M pairs) and
+  only 92.8% pair recall. That candidate volume is too large for a matcher, and the recall
+  is lower than the old 12-rule blocking union (97.87%).
+- The ground truth has a structural property we have not used: EVERY S2/S3 RECORD
+  BELONGS TO AT MOST ONE S1 (verified: 7,638,365 distinct matched IDs, 0 in >1 row).
+  At most 5 S2 and 6 S3 matches per S1. ~26% of S2/S3 records match no S1.
+  So the problem is an ASSIGNMENT problem: for each S2/S3 record, pick its one S1 or none.
+- Better architecture: REVERSE RETRIEVAL (each S2/S3 record queries the clean,
+  deduplicated 2.2M S1 index, top-K ~5-20) + vectorized sparse char-n-gram TF-IDF
+  + a gradient-boosted pair classifier + a best-S1-per-record assignment step
+  + group-consistency rescoring + expected-F0.5-optimal set selection per S1.
+- Fix 2 confirmed preprocessing bugs (Indic text destroyed; address abbreviations
+  skipped before commas) and add normalizations for the noise the data generator
+  actually injects (leet/OCR swaps, accents, native-script names, domain names,
+  zero-padded numbers, state aliases, moved legal suffixes).
+- Replace the Python per-row loops (6.76 h benchmark) with scipy-sparse/numpy batch
+  code and cached arrays. The target is a full train evaluation in well under 1 hour.
+- DEADLINE: the guidelines give the window as 25-27 Sep 2026, 23:59 IST, and today is
+  26 Sep, so the phases below are time-boxed. Get a valid submission on the leaderboard
+  early (Phase 1), then improve it.
+
+======================================================================
+1. WHAT I VERIFIED IN THE REPO / DATA (evidence)
+======================================================================
+1.1 Empty files. The handoff describes these as existing work, but all four are
+    0 bytes:
+    src/retrieval/ngram_index.py, src/retrieval/candidate_retriever.py,
+    src/candidate_generation.py, src/candidate_evaluation.py.
+    No n-gram retrieval, candidate generator, matcher or output writer exists yet.
+
+1.2 BUG — Indic scripts are destroyed by name/address cleaning.
+    preprocessing.normalize_business_name / normalize_address keep only
+    ch.isalnum() or space. Devanagari/Kannada/Tamil/Bengali vowel signs are Unicode
+    category M* (not alnum), so they become spaces:
+      "राम मार्केटिंग प्राइवेट लिमिटेड" -> "र म म र क ट ग प र इव ट ल म ट ड"
+    (checked in processed_train_source2.tsv). Words turn into 1-char tokens, which
+    wrecks token/n-gram retrieval and similarity for these records.
+    Scale: 22% of India names in S2 and 11.5% in S3 are fully native-script
+    (sample of 1M rows each). S1 has none. S1 is always Latin script.
+
+1.3 BUG — address abbreviations are skipped when punctuation is attached.
+    normalize_address maps tokens BEFORE punctuation removal, so "Drive," / "Road,"
+    / "Street," never map to dr/rd/st:
+      "1795 Westchester Drive, High Point, NC" -> "1795 westchester drive high point nc"
+    while S2's "DR" -> "dr". Almost every S1 street type is followed by a comma, so
+    S1 and S2/S3 often disagree on this token.
+
+1.4 Name-noise patterns seen in real GT groups (the generator's operators):
+    - char typos / OCR-leet swaps: 0<->o, 1/l<->i, 5<->s, "lnfrastructure",
+      "c0nsultants", "so1utions", "5ervices"; transpositions "Wanye", "Miinstres"
+    - accent injection: "Dérmatology", "Hárbor", "límited", "sólutions"
+    - legal suffix added/removed/swapped/MOVED TO FRONT: "LLC Moncada Learning
+      Center", "Pvt. EFS Print Ventures Ltd.", "pvt qur ltd sólutions"
+    - generic filler words added: Group, Trust, Center, Service, Co, LP
+    - token shuffle; all-caps; punctuation noise "--", "<<", "[..]", "|"
+    - domain form: "maurewilliamscolombier.com", "Onecare.Com", "... | www.greatpre.com"
+      (~4% of S2/S3 names)
+    - native-script transliteration of the whole name (Hindi, Kannada, Tamil,
+      Bengali, Malayalam) — the name shares 0 Latin chars with S1
+    - junk replacement names: "Lumvera", "Drxkor" — only the address can link these
+    Missing "private" and "llp"/"lp" in LEGAL_SUFFIXES; suffixes are only stripped at
+    the END.
+
+1.5 Address-noise patterns:
+    state full <-> abbrev <-> native script (NY / New York; Karnataka / KA / ಕರ್ನಾಟಕ;
+    Maharashtra / MH / महाराष्ट्र); component reordering; "TOWNSHIP"/"CITY" appended;
+    street number dropped; zero-padded numbers (71 vs 0071, 5972 vs 05972);
+    number glued to word ("no15venkatesh", "36hamsaveni"); prefixes "H.no", "NO",
+    "D No", "#"; "<NULL>" / "null" literals; truncated addresses; typos.
+    ~3.3% of S2/S3 addresses are empty. S1 addresses are never empty.
+
+1.6 Hardware: 15.8 GB RAM, 16 logical CPUs, RTX 4050 laptop GPU (6 GB).
+    The earlier miss analysis hit ~26 GB, i.e. it was swapping. Everything must be
+    memory-lean: int32 ids, float32, sparse matrices, per-country / chunked work.
+    Installed: rapidfuzz 3.14, scikit-learn 1.9, scipy 1.17, xgboost 3.2.
+    Not installed: pyarrow, lightgbm, sparse_dot_topn, anyascii, faiss.
+
+======================================================================
+2. WHAT IS WRONG WITH THE CURRENT APPROACH
+======================================================================
+W1  Wrong search direction + ignoring the one-S1-per-record constraint.
+    S1 -> S2/S3 with a fixed top-200 per field means each S1 competes with nobody.
+    The same S2 record appears in hundreds of S1 candidate lists, and the matcher
+    would have to reject each copy separately. Reverse it: each S2/S3 record
+    picks among S1s. S1 is clean and deduplicated, so the "which S1 is closest"
+    competition is meaningful, and the argmax/margin becomes a very strong feature.
+
+W2  Candidate volume is capped, not earned. Median 397 of max 400 means the cap binds
+    for almost every S1. Recall is limited by truncation and by ties broken by row
+    position (arbitrary), not by lack of signal. ~825M pairs is also infeasible
+    to featurize with rapidfuzz in the time left.
+
+W3  Name and address are retrieved separately and unioned, never scored jointly.
+    The strongest evidence (same street number + similar name) is never used for
+    ranking. A candidate that is mediocre on both can lose to 200 candidates that
+    are strong on only one field.
+
+W4  Token-level signals only. The misses are dominated by character noise
+    (75.6% of old-blocking misses share no name token). Char n-grams / fuzzy keys
+    are required. The planned ngram_index.py does not exist.
+
+W5  Normalization gaps (section 1.2-1.5) are the root cause of many "no shared
+    token" misses. Fixing them is cheaper than any retrieval trick.
+
+W6  Engineering: pure-Python dict-of-list posting lists, itertuples loops, and
+    re-reading 12.5M-row TSVs every run. The full benchmark took 6.76 h. The
+    "50K sample" is s1.head(50000), which is file-order, not random.
+
+W7  Metric plumbing: no per-S1 F0.5 evaluator exists yet. There is no "oracle
+    ceiling" (the F0.5 a perfect matcher would get on the given candidates), so
+    retrieval changes cannot be judged in F0.5 terms. Macro recall counts
+    zero-match S1 as 1.0, which inflates it.
+
+W8  Regression hidden by the architecture switch: old 12-rule blocking union had
+    97.87% pair recall, but Exact+Token has only 92.80%. The switch lost 5 points of
+    ceiling. (Old-union candidate volume was never measured.)
+
+W9  Implementatiion_Plan.txt is stale (describes the blocking era) and the handoff
+    claims n-gram/candidate code exists when it does not.
+
+======================================================================
+3. WHAT 0.99 MEANS (be realistic, measure every ceiling)
+======================================================================
+- Macro F0.5 over S1. Mean loss must be <= 0.01 per S1.
+- One false match on a zero-match S1 (5.6% of S1) costs a full 1.0.
+- Missing 1 of 4 true matches with perfect precision: F0.5 = 0.9375.
+- One false positive among 4 true matches: P=0.8, R=1, F0.5 = 0.833.
+=> 0.99 needs ~99.5%+ candidate recall, very high precision, AND near-perfect
+   zero-match detection. It is a stretch goal. Every phase below reports its
+   measured ceiling so we know where the loss comes from.
+   Oracle ceiling for a candidate set: per S1, r = fraction of true matches present;
+   F_oracle = 1.25r/(0.25+r) (1.0 for zero-match S1). Macro-average this.
+
+======================================================================
+4. TARGET ARCHITECTURE
+======================================================================
+ raw TSV -> preprocessing v2 (additive columns, bugs fixed) -> cached .npy/.parquet
+         -> learned alias tables (state aliases, native-script->Latin token dict,
+            filler words) from TRAIN GT only
+         -> REVERSE RETRIEVAL: every S2/S3 record q -> top-K S1 in same country
+              channels: (a) name char-3/4-gram TF-IDF  (b) address char-gram+token
+              TF-IDF  (c) combined weighted vector  (d) exact keys (street number
+              + street token, phone-like numbers, domain-split name)
+              union per q, K per channel ~5-10
+         -> stage-1 cheap ranker (retrieval scores only) keeps top-M S1 per q
+            (M ~ 5)  ==> THIS is candidate_pairs.tsv (inverted to S1 rows)
+         -> pair features (rapidfuzz, vectorized) + GBDT classifier (XGBoost GPU)
+         -> assignment: each q -> argmax S1 if p >= t (enforces 1 S1 per record)
+         -> group consistency pass: rescore candidates against already accepted
+            members of the same S1 (catches junk/native-script names at the same
+            address); enforce <=5 S2, <=6 S3 per S1
+         -> per-S1 expected-F0.5-optimal subset (incl. empty set)
+         -> matching_results.tsv ; validate ; subset check
+ Candidate volume is bounded by construction: (4.89M+5.08M) test records x M.
+ With M=5 that is <=50M pairs (~29 per S1), versus ~825M now.
+
+======================================================================
+5. STEP-WISE IMPLEMENTATION PLAN
+======================================================================
+Conventions: run with $env:PYTHONPATH="$PWD\code"; python -m
+business_entity_resolution.src.<module>. Every experiment logs pair recall,
+macro-S1 recall, oracle F0.5, candidate mean/median/p90/p95/p99/max, zero-candidate
+S1, runtime, peak RAM. Never call retrieval recall "accuracy".
+
+---------------- PHASE 0 — Foundations (~2-3 h) ----------------
+0.1 src/io_cache.py: load each raw/processed TSV ONCE (csv QUOTE_NONE, utf-8),
+    store columns as parquet (pip install pyarrow) or .npy. Map entity_id to int32
+    row index per source. Later runs load in seconds.
+0.2 src/gt.py: parse GT (comma split!) into int arrays: q_index -> true S1 index
+    (-1 if unmatched), for S2 and S3. This "record-side" form fits the reverse
+    direction. Also per-S1 true sets for F0.5.
+0.3 src/eval/f05.py: exact per-S1 macro F0.5 (challenge definition: empty/empty=1,
+    empty-truth+any-pred=0), oracle ceiling from candidates, recall@K per record,
+    per-country and per-bucket breakdowns (zero / 1 / multi-match S1).
+0.4 Validation split: hash(S1 id) -> 90% train-S1 / 10% val-S1. A pair belongs to
+    the split of its S1. The S1 index always contains ALL S1 (same as test). Also an
+    unseen-country check: train on US only -> score India val (proxy for France).
+0.5 Dev sampling: a random 200K sample of S2+S3 query records against the FULL S1
+    index gives unbiased recall@K. Full runs happen only once the code is vectorized.
+
+---------------- PHASE 1 — Fast-track first submission (~4-6 h) ----------------
+Goal: a valid, reasonable leaderboard score ASAP, from the same skeleton we will
+improve.
+1.1 preprocessing v2 — src/normalize_v2.py, ADDITIVE columns (keep v1 columns so old
+    benchmarks stay reproducible):
+    a. Clean: keep Unicode categories L*, N*, AND M* (fixes 1.2). For Latin letters
+       only: NFKD + drop combining marks (accent removal).
+    b. Address: remove punctuation FIRST, then map abbreviations (fixes 1.3). Extend
+       the map: north/n, south/s, east/e, west/w, highway/hwy, floor/flr, building/
+       bldg, road/rd, nagar, marg, colony, sector; French: rue, avenue/av,
+       boulevard/bd, allee, chemin, place/pl — data-driven additions in 2.1.
+    c. Numbers: strip leading zeros; split digit-letter glue ("no15venkatesh" ->
+       "15 venkatesh"); drop noise tokens: null, <null>, township, city, h no, d no,
+       no, #.
+    d. Names: remove legal/filler tokens ANYWHERE (inc, llc, ltd, limited, private,
+       pvt, corp, co, company, llp, lp, plc, sarl, sa, sas, eurl, snc + learned
+       fillers); domain handling (strip www./.com/.in, keep a "concat" key with
+       spaces removed); leet/OCR folding key (0->o,1->l,5->s,3->e,4->a,@->a; then
+       l/i -> i); a no-space "squash" key for concatenation/domain matches.
+    e. Country: keep open-set string, no hard-coding.
+1.2 src/retrieval/tfidf_reverse.py (vectorized):
+    - sklearn TfidfVectorizer(analyzer="char_wb", ngram_range=(3,3), dtype=float32,
+      min_df=2, sublinear_tf) fit on S1 per field. Use the folded name key for names
+      and the v2 address for addresses. Partition by country (new countries: fit on
+      that country's S1).
+    - top-K cosine: pip install sparse_dot_topn (MIT, multithreaded, memory-safe
+      top-n sparse matmul). Fallback: chunked X_q @ X_s1.T with np.argpartition,
+      10-50K query rows per chunk.
+    - channels: name top-10, address top-10, combined (0.5/0.5 hstack) top-10;
+      union per query record.
+1.3 Rule-based matcher v0: combined score + name/address rapidfuzz ratios.
+    Assign each q to its argmax S1 if score >= t. Tune t on val-S1 for F0.5.
+1.4 src/pipeline/run_test.py: same code on test -> output/candidate_pairs.tsv
+    (inverted per S1, all test S1 rows, empty allowed) + output/matching_results.tsv.
+    Assert matches ⊆ candidates and no duplicates. Run
+    dataset/utils/validate_submission.py. SUBMIT.
+1.5 Record: recall@K on dev sample, full-train oracle ceiling, val F0.5, LB score.
+
+---------------- PHASE 2 — Retrieval to >= 99.5% recall at bounded volume (~4 h) ----
+2.1 src/learn_aliases.py (TRAIN GT ONLY — allowed, no external data):
+    a. State alias table: align S1 state (last address component) with tokens in its
+       matches' addresses -> {NY, New York, ...}, {Karnataka, KA, ಕರ್ನಾಟಕ, ...}.
+       Canonicalize to one code. (US postal abbreviations may also be hardcoded as
+       a static list; this is not an entity lookup.)
+    b. Native-script -> Latin token dictionary: for pairs where the S2/S3 name is
+       non-Latin and S1 has the same token count (after removing suffixes),
+       align tokens by position and keep (native, latin) pairs with support >= 3
+       and purity >= 0.7. Example: प्राइवेट->private, लिमिटेड->limited, केयर->care.
+       Fallback for unseen tokens: anyascii (ISC license) romanization
+       + consonant-skeleton key.
+    c. Filler / inserted-word list: tokens far more frequent in match names than
+       in S1 names (group, trust, center, service, ...).
+2.2 Add exact/structured channels (cheap hash joins, numpy): (street number +
+    first street token), (squash name), (translated name), (canonical state + city
+    + street number).
+2.3 Recall analysis on the 200K dev sample, bucketed by noise type (native script,
+    junk name, missing address, domain name). For each remaining miss, report: true
+    S1 rank per channel, score gap, which normalization would have fixed it.
+    Iterate 2.1-2.2 until recall@union >= 99.5% with M <= ~8 per record.
+2.4 Optional dense channel ONLY if native-script/junk-name misses stay high: a
+    multilingual small encoder (e.g. multilingual-e5-small, MIT, ~118M params, well
+    under the 8B limit) on name+address, run on the GPU. FAISS/numpy top-K within
+    country. Budget ~1 h to embed 12M short strings; test on the 200K sample first.
+2.5 Stage-1 pruning: a tiny logistic/GBDT model on retrieval-only features
+    (per-channel cosines, ranks, number match) keeps top-M per record. Measure
+    recall loss vs M. The OUTPUT of this step is the official candidate set.
+
+---------------- PHASE 3 — Matcher (~4-6 h) ----------------
+3.1 src/matching/features.py (vectorized; rapidfuzz.process.cpdist with workers=-1):
+    Name (raw-clean, folded, no-suffix, translated, squash):
+      ratio, partial_ratio, token_set_ratio, token_sort_ratio, JaroWinkler,
+      char-3gram cosine, prefix match len, length ratio, is_native_script,
+      is_domain, name_is_junk (no char-3gram overlap with S1 AND low similarity
+      to all its top-K S1)
+    Address: token Jaccard, token_set_ratio, street-number exact match (zero-
+      stripped), number-set Jaccard, canonical state equal, city token match,
+      q address missing, S1-address-contains-q-address (truncation), char cosine
+    Competition (key feature): rank of this S1 among q's candidates, score margin to
+      best/2nd-best S1, number of S1 with near-equal score
+    Source: S2 vs S3 flag (they have different noise profiles)
+    NO country one-hot; country-agnostic features only (France).
+3.2 Training set: all stage-1 candidate pairs for train-S1 (positives = GT).
+    Negatives are naturally hard. Keep all pairs if RAM allows (~40-50M rows x
+    ~40 float32 ≈ 8 GB is too big): train on all positives + a sampled 30% of
+    negatives with weights, or train in chunks via xgboost QuantileDMatrix /
+    external memory. Use tree_method="hist", device="cuda".
+3.3 Out-of-fold (2-fold by S1) predictions for train so stage-2 group features are
+    unbiased.
+3.4 Group-consistency stage-2 model: for each candidate, add max/mean similarity to
+    the OTHER members accepted for that S1 in stage-1 (name and address), count of
+    accepted members, count per source vs caps. Recovers "Lumvera"-style junk-name
+    members and native-script duplicates. Also adds consistency between S2/S3
+    records that are near-duplicates of each other.
+3.5 Calibrate probabilities (isotonic on val).
+
+---------------- PHASE 4 — Decision rule tuned for per-S1 F0.5 (~2 h) ------------
+4.1 Assignment: each q goes only to argmax-p S1 (hard constraint from GT).
+4.2 Per S1: sort assigned candidates by p; choose the prefix (including EMPTY)
+    maximizing EXPECTED F0.5 under the calibrated probabilities (standard
+    expected-F-measure decision; exact enough to compute by Monte Carlo or the
+    independence approximation). Enforce <=5 S2 / <=6 S3.
+4.3 Tune global knobs (min p, margin) on val-S1 for macro F0.5. Report by bucket:
+    zero-match S1 (target >= 0.99 empty-accuracy), single, multi; US vs India;
+    unseen-country proxy.
+
+---------------- PHASE 5 — Error analysis loop ----------------
+5.1 Dump top-500 val losses by F0.5 impact, classify: retrieval miss / false merge
+    / missed member / wrong empty. Fix the biggest category first (usually a
+    normalization or a feature), re-run the dev loop, and only then the full run.
+5.2 Keep a results table (results/experiments.csv) with every metric in the
+    conventions line. Submit only when val F0.5 improves (5 submissions/day).
+
+---------------- PHASE 6 — Final outputs & packaging ----------------
+6.1 Test run end-to-end from raw TSV -> outputs. Check: every test S1 has a row
+    (1,732,544), no duplicates, S2/S3 prefixes only, matches ⊆ candidates, France
+    rows present.
+6.2 validate_submission.py with --candidate (and --check-ids if RAM allows,
+    otherwise without --candidate).
+6.3 README.md exact reproduction commands; requirements.txt pinned (add pyarrow,
+    sparse_dot_topn, anyascii, lightgbm/xgboost versions); fill
+    Documentation_template.md with measured numbers only.
+6.4 Zip: output/, code/business_entity_resolution/{src,README.md,requirements.txt},
+    Documentation_template.md. No datasets.
+
+======================================================================
+6. KEEP / CHANGE / RETIRE
+======================================================================
+KEEP   preprocessing.py v1 columns (for reproducibility), GT parsing with ",",
+       config.py (extend, don't rewrite), benchmark result CSVs as baselines.
+CHANGE preprocessing: add v2 columns (bug fixes 1.2/1.3 + new keys). Benchmark v2 vs
+       v1 on the same dev sample before adopting.
+RETIRE from the main path: S1->S2/S3 token retrieval with a 200+200 cap, 12-rule
+       blocking, Python dict posting lists, and 6.7 h full benchmarks. Keep the files
+       as documented baselines.
+
+======================================================================
+7. RISKS & MITIGATIONS
+======================================================================
+- RAM (15.8 GB): per-country processing, float32, sparse top-n, chunked features,
+  del + gc between stages, never materialize pair sets as Python tuples.
+- France unseen: country-agnostic features; normalization with French street
+  words and suffixes; unseen-country validation proxy (US-only model -> India).
+- Test distribution shift: thresholds via expected-F0.5 on calibrated p, not hard
+  cut-offs tuned to train quirks.
+- Time: Phase 1 submission first. Every later phase must beat it on val F0.5
+  before it is submitted.
+- Compliance: no external lookups/APIs. Alias/translation tables are learned from
+  training data only. Any model used must be MIT/Apache and <= 8B params.
