@@ -3198,3 +3198,303 @@ So our next milestone should be:
 Optimize token retrieval → run exact+token on all 2.2M S1 → measure full-data pair recall + per-S1 recall → analyze the remaining misses → add character n-gram retrieval → repeat.
 
 That will give us an evidence-based path toward a candidate-recall ceiling high enough for the final F0.5 optimization.
+
+
+
+
+
+
+
+
+
+Version	Method	Recall	Mean candidates	Runtime
+Old	Token	89.9008%	349.79	~440.7 s
+New	Token	89.9163%	349.79	189.8 s
+Old	Exact + Token	92.9362%	373.30	~475.3 s
+New	Exact + Token	92.9397%	373.30	222.7 s
+
+
+Next step: FULL-DATA Exact + Token evaluation
+
+We now have enough evidence that the refactored implementation preserves the previous behavior and is substantially faster.
+
+So the next step is exactly what we planned:
+
+2,206,821 S1
+        ↓
+Exact + Token retrieval
+        ↓
+measure all 7,638,365 ground-truth pairs
+
+This will tell us the actual candidate recall on the entire training population.
+
+More importantly, we need to answer your original 162,684 old-blocking-miss question.
+
+But we should NOT simply change head(50_000) and run it
+
+There is one modification I want to make before the full run.
+
+Your current benchmark does this conceptually:
+
+retrieved_pairs = set()
+
+For 2.2M S1 records and potentially hundreds of candidates per S1, that can become a very large Python object.
+
+Instead, the full benchmark should evaluate S1-by-S1.
+
+For each S1:
+
+truth = true S2/S3 matches for this S1
+
+candidates = Exact + Token retrieval
+
+recovered = truth ∩ candidates
+
+Then immediately accumulate:
+
+total_true_pairs
+total_recovered_pairs
+total_missed_pairs
+
+per-S1 recall statistics
+candidate statistics
+
+and discard that S1's candidate set.
+
+This avoids retaining potentially tens/hundreds of millions of Python tuples.
+
+We also need to preserve the old blocking result
+
+There is an important distinction.
+
+We already know:
+
+Old blocking:
+
+Recovered = 7,475,681
+Missed    =   162,684
+
+Total GT  = 7,638,365
+
+For the full Exact + Token run, we want:
+
+Ground truth
+    │
+    ├── recovered by old blocking
+    │
+    ├── recovered by Exact + Token
+    │
+    ├── recovered by BOTH
+    │
+    └── missed by BOTH
+
+Specifically:
+
+A. Old blocking misses
+162,684
+B. Of those 162,684, how many does Exact + Token recover?
+
+This is the key experiment.
+
+We want:
+
+old_blocking_misses_recovered_by_exact_token = ???
+old_blocking_misses_still_missed             = ???
+One complication
+
+To calculate that overlap exactly, the full benchmark needs access to the old blocking candidate pairs, not merely its aggregate number 162,684.
+
+If your existing blocking_recall.py only reports:
+
+7,475,681 recovered
+162,684 missed
+
+but doesn't save the actual missed (S1, entity) pairs, we should not fabricate the overlap.
+
+We can regenerate the old blocking decisions from the existing blocking.py, but we should do it in a memory-conscious way.
+
+Full experiment we should build
+
+I recommend creating a new benchmark file, rather than modifying the existing 50K benchmark.
+
+For example:
+
+src/retrieval/full_retrieval_benchmark.py
+
+This keeps the controlled 50K experiment reproducible.
+
+It should report:
+
+============================================================
+FULL RETRIEVAL BENCHMARK
+============================================================
+
+S1 records: 2,206,821
+S2 records: 5,034,616
+S3 records: 5,285,603
+Ground-truth pairs: 7,638,365
+
+------------------------------------------------------------
+EXACT
+------------------------------------------------------------
+recovered:
+recall:
+candidate statistics:
+
+------------------------------------------------------------
+TOKEN
+------------------------------------------------------------
+recovered:
+recall:
+candidate statistics:
+
+------------------------------------------------------------
+EXACT + TOKEN
+------------------------------------------------------------
+recovered:
+recall:
+candidate statistics:
+
+------------------------------------------------------------
+OLD BLOCKING vs EXACT + TOKEN
+------------------------------------------------------------
+Old blocking recovered:
+Old blocking missed:
+
+Old blocking misses recovered by Exact + Token:
+Old blocking misses still missed:
+
+Recovered by either method:
+Missed by both:
+
+And additionally:
+
+------------------------------------------------------------
+PER-S1 RECALL
+------------------------------------------------------------
+
+0.0 recall S1s:
+< 0.5 recall S1s:
+< 0.8 recall S1s:
+< 0.9 recall S1s:
+< 1.0 recall S1s:
+1.0 recall S1s:
+There is another important metric
+
+For candidate generation, pair recall alone isn't sufficient.
+
+Suppose:
+
+Exact + Token
+99.5% pair recall
+
+but it produces:
+
+1,000 candidates per S1
+
+That could make the downstream matcher expensive.
+
+Conversely:
+
+98.5% recall
+
+with:
+
+100 candidates/S1
+
+may be easier to process.
+
+So the full benchmark should retain:
+
+mean candidates
+median
+p90
+p95
+p99
+max
+zero-candidate S1
+
+just like the 50K benchmark.
+
+Do we need n-grams now?
+
+Not yet.
+
+The correct sequence is:
+
+                 CURRENT STATE
+                      │
+                      ▼
+             50K refactor test
+                      │
+                      ▼
+             PASSED / ~92.94%
+                      │
+                      ▼
+             FULL Exact + Token
+                      │
+                      ▼
+       ┌──────────────┴──────────────┐
+       │                             │
+       ▼                             ▼
+  high recall                  significant misses
+       │                             │
+       │                             ▼
+       │                     Analyze failure modes
+       │                             │
+       │                             ▼
+       │                     Character n-grams
+       │
+       ▼
+  candidate-volume
+      analysis
+
+The crucial point is that the 12,230 misses in the 50K sample are not necessarily the same type of failures as the old blocker's 162,684 misses.
+
+We need to inspect the new retrieval misses.
+
+What I recommend doing RIGHT NOW
+Don't change:
+token_index.py
+exact_index.py
+blocking.py
+preprocessing.py
+Don't tune:
+max_df
+top_k
+max_candidates
+Don't implement n-grams yet.
+Instead:
+
+Create the memory-efficient full-data benchmark.
+
+It should evaluate:
+
+S1 = 2,206,821
+S2 = 5,034,616
+S3 = 5,285,603
+GT = 7,638,365 pairs
+
+with the current proven settings:
+
+max_df = 10,000
+top_k = 5
+max_candidates = 200
+
+and calculate:
+
+Exact recall
+Token recall
+Exact + Token recall
+Candidate-count distribution
+Per-S1 recall distribution
+Old-blocking vs Exact+Token overlap
+How many of the old 162,684 misses are recovered
+How many are still missed by both
+Most important:
+
+Your current 50K result means the optimization succeeded. We have gone from an uncertain refactor to a validated retrieval implementation.
+
+Now the next engineering task is the full-data benchmark, not another algorithm.
+
+If you want, I can give you the complete full_retrieval_benchmark.py code designed specifically to avoid the giant retrieved_pairs memory problem and produce all of the metrics above.
