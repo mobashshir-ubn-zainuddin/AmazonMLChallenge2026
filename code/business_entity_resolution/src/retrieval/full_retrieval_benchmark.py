@@ -23,13 +23,12 @@ Run:
 from __future__ import annotations
 
 import csv
-import math
-import statistics
 import time
-from collections import defaultdict
+from array import array
 from pathlib import Path
 from typing import Dict, Iterable, List, Set, Tuple
 
+import numpy as np
 import pandas as pd
 
 from business_entity_resolution.src.blocking import create_blocking_keys
@@ -43,12 +42,13 @@ from business_entity_resolution.src.retrieval.token_index import TokenIndex
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
-TRAIN_DIR = PROJECT_ROOT / "dataset" / "dataset" / "train"
+PROCESSED_TRAIN_DIR = PROJECT_ROOT / "processed" / "train"
+GROUND_TRUTH_DIR = PROJECT_ROOT / "dataset" / "dataset" / "train"
 
-S1_PATH = TRAIN_DIR / "train_source1.tsv"
-S2_PATH = TRAIN_DIR / "train_source2.tsv"
-S3_PATH = TRAIN_DIR / "train_source3.tsv"
-GT_PATH = TRAIN_DIR / "train_ground_truth.tsv"
+S1_PATH = PROCESSED_TRAIN_DIR / "processed_train_source1.tsv"
+S2_PATH = PROCESSED_TRAIN_DIR / "processed_train_source2.tsv"
+S3_PATH = PROCESSED_TRAIN_DIR / "processed_train_source3.tsv"
+GT_PATH = GROUND_TRUTH_DIR / "train_ground_truth.tsv"
 
 RESULT_DIR = PROJECT_ROOT / "code" / "blocking_results"
 
@@ -93,38 +93,28 @@ def parse_matched_ids(value) -> Set[str]:
     # Keep a small amount of robustness for whitespace.
     return {
         item.strip()
-        for item in value.split(";")
+        for item in value.split(",")
         if item.strip()
     }
 
 
-def percentile(values: List[int], q: float) -> float:
-    """Compute percentile without requiring NumPy."""
-    if not values:
+def percentile(values, q: float) -> float:
+    """Calculate an exact percentile using a compact NumPy array."""
+    if len(values) == 0:
         return 0.0
 
-    values_sorted = sorted(values)
-
-    if len(values_sorted) == 1:
-        return float(values_sorted[0])
-
-    position = (len(values_sorted) - 1) * q
-    lower = math.floor(position)
-    upper = math.ceil(position)
-
-    if lower == upper:
-        return float(values_sorted[lower])
-
-    fraction = position - lower
-
-    return (
-        values_sorted[lower]
-        + fraction * (values_sorted[upper] - values_sorted[lower])
-    )
+    values_array = np.asarray(values, dtype=np.int64)
+    return float(np.quantile(values_array, q))
 
 
-def candidate_statistics(candidate_counts: List[int]) -> Dict[str, float]:
-    """Calculate candidate-count statistics."""
+def candidate_statistics(candidate_counts: array) -> Dict[str, float]:
+    """
+    Calculate candidate-count statistics without retaining a Python list
+    of millions of Python integers.
+
+    The resulting statistics use the same percentile definitions as the
+    original implementation.
+    """
     if not candidate_counts:
         return {
             "mean": 0.0,
@@ -136,14 +126,16 @@ def candidate_statistics(candidate_counts: List[int]) -> Dict[str, float]:
             "zero": 0,
         }
 
+    values_array = np.asarray(candidate_counts, dtype=np.int64)
+
     return {
-        "mean": statistics.fmean(candidate_counts),
-        "median": statistics.median(candidate_counts),
-        "p90": percentile(candidate_counts, 0.90),
-        "p95": percentile(candidate_counts, 0.95),
-        "p99": percentile(candidate_counts, 0.99),
-        "max": max(candidate_counts),
-        "zero": sum(x == 0 for x in candidate_counts),
+        "mean": float(values_array.mean()),
+        "median": float(np.quantile(values_array, 0.50)),
+        "p90": float(np.quantile(values_array, 0.90)),
+        "p95": float(np.quantile(values_array, 0.95)),
+        "p99": float(np.quantile(values_array, 0.99)),
+        "max": int(values_array.max()),
+        "zero": int(np.count_nonzero(values_array == 0)),
     }
 
 
@@ -162,20 +154,24 @@ def print_candidate_statistics(stats: Dict[str, float]) -> None:
 # Ground-truth loading
 # ============================================================
 
-def load_ground_truth(path: Path) -> Dict[str, Set[str]]:
+def load_ground_truth(path: Path) -> pd.Series:
     """
-    Load ground truth into:
+    Load ground truth as a memory-efficient indexed pandas Series:
 
-        source1_entity_id -> set(matched_entity_ids)
+        source1_entity_id -> matched_entity_ids string
 
-    This is approximately 2.2M dictionary entries and is required
-    for S1-by-S1 evaluation.
+    The previous implementation materialized approximately 2.2M Python
+    dictionary entries and a Python set for every S1 record. That creates
+    substantial object overhead. Keeping the delimiter-separated match IDs
+    as strings preserves the same information while parsing only the
+    current S1 record during evaluation.
     """
     print("Loading ground truth...")
 
     gt = pd.read_csv(
         path,
         sep="\t",
+        usecols=["source1_entity_id", "matched_entity_ids"],
         dtype=str,
         keep_default_na=False,
     )
@@ -192,17 +188,27 @@ def load_ground_truth(path: Path) -> Dict[str, Set[str]]:
             f"Ground-truth file is missing columns: {sorted(missing)}"
         )
 
-    ground_truth: Dict[str, Set[str]] = {}
+    gt["source1_entity_id"] = gt["source1_entity_id"].map(normalize_id)
+    gt["matched_entity_ids"] = gt["matched_entity_ids"].fillna("")
 
-    for row in gt.itertuples(index=False):
-        source1_id = normalize_id(row.source1_entity_id)
-        matched = parse_matched_ids(row.matched_entity_ids)
-
-        ground_truth[source1_id] = matched
+    # The challenge has one ground-truth row per Source 1 entity.
+    # Keep the same ID-based lookup semantics as the original dict.
+    ground_truth = gt.set_index("source1_entity_id")["matched_entity_ids"]
 
     print(f"Ground-truth S1 records: {len(ground_truth):,}")
 
     return ground_truth
+
+
+def ground_truth_matches(ground_truth: pd.Series, source1_id: str) -> Set[str]:
+    """
+    Parse only one S1 record's matched IDs at evaluation time.
+
+    This preserves the original set-based intersection semantics without
+    storing 2.2M Python sets simultaneously.
+    """
+    value = ground_truth.get(source1_id, "")
+    return parse_matched_ids(value)
 
 
 # ============================================================
@@ -329,9 +335,13 @@ class EvaluationAccumulator:
         self.total_true_pairs = 0
         self.total_recovered_pairs = 0
 
-        self.candidate_counts: List[int] = []
+        # Candidate counts are bounded by the retrieval configuration and
+        # are therefore stored as compact unsigned integers.
+        self.candidate_counts = array("I")
 
-        self.s1_recall_values: List[float] = []
+        # Keep only the sum/count needed for the macro S1 recall.
+        self.s1_recall_sum = 0.0
+        self.s1_recall_count = 0
 
         self.zero_recall_s1 = 0
         self.lt_50_recall_s1 = 0
@@ -363,7 +373,8 @@ class EvaluationAccumulator:
         else:
             recall = recovered_count / true_count
 
-        self.s1_recall_values.append(recall)
+        self.s1_recall_sum += recall
+        self.s1_recall_count += 1
 
         if recall == 0.0:
             self.zero_recall_s1 += 1
@@ -396,10 +407,10 @@ class EvaluationAccumulator:
 
     @property
     def macro_s1_recall(self) -> float:
-        if not self.s1_recall_values:
+        if self.s1_recall_count == 0:
             return 0.0
 
-        return statistics.fmean(self.s1_recall_values)
+        return self.s1_recall_sum / self.s1_recall_count
 
     def candidate_stats(self) -> Dict[str, float]:
         return candidate_statistics(self.candidate_counts)
@@ -407,7 +418,7 @@ class EvaluationAccumulator:
 
 def evaluate_retrieval(
     s1: pd.DataFrame,
-    ground_truth: Dict[str, Set[str]],
+    ground_truth: pd.Series,
     retrieve_function,
     method_name: str,
 ) -> EvaluationAccumulator:
@@ -428,9 +439,9 @@ def evaluate_retrieval(
     ):
         source1_id = normalize_id(row.entity_id)
 
-        truth = ground_truth.get(
+        truth = ground_truth_matches(
+            ground_truth,
             source1_id,
-            set(),
         )
 
         candidates = retrieve_function(row)
@@ -506,9 +517,22 @@ def main() -> None:
     print()
     print("Loading data...")
 
+    # Load only columns consumed by the exact and token indexes plus S1 ID.
+    # This avoids carrying unrelated processed columns through the full run.
+    required_data_columns = [
+        "entity_id",
+        "country_clean",
+        "name_clean",
+        "name_no_legal_suffix",
+        "address_clean",
+        "name_tokens",
+        "address_tokens",
+    ]
+
     s1 = pd.read_csv(
         S1_PATH,
         sep="\t",
+        usecols=required_data_columns,
         dtype=str,
         keep_default_na=False,
     )
@@ -516,6 +540,7 @@ def main() -> None:
     s2 = pd.read_csv(
         S2_PATH,
         sep="\t",
+        usecols=required_data_columns,
         dtype=str,
         keep_default_na=False,
     )
@@ -523,6 +548,7 @@ def main() -> None:
     s3 = pd.read_csv(
         S3_PATH,
         sep="\t",
+        usecols=required_data_columns,
         dtype=str,
         keep_default_na=False,
     )
@@ -538,8 +564,8 @@ def main() -> None:
     ground_truth = load_ground_truth(GT_PATH)
 
     total_true_pairs = sum(
-        len(matches)
-        for matches in ground_truth.values()
+        len(parse_matched_ids(value))
+        for value in ground_truth.values
     )
 
     print(
@@ -568,7 +594,15 @@ def main() -> None:
         s2,
         s3,
     )
+    # S2 and S3 DataFrames are no longer needed.
+    # Both retrieval indexes have already been constructed.
+    import gc
 
+    del s2
+    del s3
+    gc.collect()
+
+    print("Released S2/S3 DataFrames from memory.")
     # --------------------------------------------------------
     # EXACT
     # --------------------------------------------------------
