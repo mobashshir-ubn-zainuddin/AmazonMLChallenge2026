@@ -76,13 +76,18 @@ def find_split_dir(data_dir: Path, split: str) -> Path:
     data_dir (Kaggle datasets often add an extra folder level).
     """
     target = SOURCE_FILES[split]["s1"]
-    for cand in [data_dir / split, data_dir / "dataset" / split, data_dir]:
+    for cand in [data_dir / split, data_dir / "dataset" / split, data_dir / "dataset" / "dataset" / split, data_dir]:
         if (cand / target).is_file():
             return cand
-    hits = list(data_dir.rglob(target))
-    if not hits:
-        raise FileNotFoundError(f"{target} not found under {data_dir}")
-    return hits[0].parent
+    # Kaggle mounts inputs through symlinks; Path.rglob does not follow them, os.walk can.
+    roots = [data_dir] + ([Path("/kaggle/input")] if Path("/kaggle/input").is_dir() else [])
+    for root in roots:
+        for dirpath, _, filenames in os.walk(root, followlinks=True):
+            if target in filenames:
+                if root != data_dir:
+                    log(f"NOTE: {target} not under {data_dir}; using {dirpath}")
+                return Path(dirpath)
+    raise FileNotFoundError(f"{target} not found under {data_dir} (or /kaggle/input)")
 
 
 def split_work_dir(work_dir: Path, split: str) -> Path:
