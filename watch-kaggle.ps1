@@ -1,8 +1,14 @@
 $Kernel = "mobashshirzainuddin1/amazonmlchallenge"
 $OutputDir = "C:\Users\fateh\AmazonMLChallenge\output"
 # matching_results.zip = leaderboard file; matcher_meta.json = validation F0.5/threshold.
-# Add "|candidate_pairs\.zip" (~620 MB) when you need it for the final submission package.
+# candidate_pairs.zip (~620 MB) is needed for the final submission package.
+# artifacts/ (~4 GB: trained models, candidate sets, test scores) lets you reuse the run later.
+$DownloadCandidates = $true
+$DownloadArtifacts  = $true
 $Pattern = "matching_results\.zip|matcher_meta\.json"
+if ($DownloadCandidates) { $Pattern += "|candidate_pairs\.zip" }
+if ($DownloadArtifacts)  { $Pattern += "|artifacts/" }
+$env:PYTHONIOENCODING = "utf-8"   # the Kaggle CLI crashes printing non-ASCII log text on cp1252 consoles
 
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 
@@ -55,6 +61,9 @@ while ($true) {
                    Sort-Object LastWriteTime -Descending | Select-Object -First 1
             if ($zip -and $zip.Length -gt 0) {
                 Expand-Archive -Path $zip.FullName -DestinationPath $OutputDir -Force
+                $cz = Get-ChildItem -Path $OutputDir -Recurse -Filter "candidate_pairs.zip" -ErrorAction SilentlyContinue |
+                      Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                if ($cz) { Expand-Archive -Path $cz.FullName -DestinationPath $OutputDir -Force }
                 $meta = Get-ChildItem -Path $OutputDir -Recurse -Filter "matcher_meta.json" -ErrorAction SilentlyContinue |
                         Select-Object -First 1
                 if ($meta) { Copy-Item $meta.FullName (Join-Path $OutputDir "matcher_meta.json") -Force }

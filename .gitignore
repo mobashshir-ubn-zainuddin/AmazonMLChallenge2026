@@ -112,3 +112,6 @@ dist/
 
 .cache/
 cache/
+# Submission archives / local pipeline caches
+*_submission.zip
+work/

@@ -129,8 +129,13 @@ def run(data_dir: Path, work_dir: Path, split: str, workers: int = 0) -> None:
     gt = None
     if split == "train":
         gt = read_ground_truth(src_dir / files["gt"])
-        with timer("learn transliteration dictionaries"):
-            tr = learn_translit(raw, gt, work_dir)
+        if (work_dir / "translit.json").is_file():
+            # restored from a previous run: keep it so normalization matches saved artifacts
+            tr = load_json(work_dir / "translit.json")
+            log(f"reusing existing translit.json ({len(tr['name']):,} name tokens)")
+        else:
+            with timer("learn transliteration dictionaries"):
+                tr = learn_translit(raw, gt, work_dir)
     else:
         path = work_dir / "translit.json"
         tr = load_json(path) if path.is_file() else {"name": {}, "segment": {}}
