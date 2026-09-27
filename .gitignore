@@ -46,7 +46,6 @@ htmlcov/
 *.tsv
 
 # Large dataset / generated-data directories
-dataset/
 processed/
 output/
 
