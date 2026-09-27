@@ -334,3 +334,56 @@ RETIRE from the main path: S1->S2/S3 token retrieval with a 200+200 cap, 12-rule
   before it is submitted.
 - Compliance: no external lookups/APIs. Alias/translation tables are learned from
   training data only. Any model used must be MIT/Apache and <= 8B params.
+
+======================================================================
+8. STATUS UPDATE — 2026-09-27 (after first full Kaggle run)
+======================================================================
+8.1 Measured (full train, Kaggle T4 x2)
+    Retrieval (reverse, dim 1024, k 3/3/8):  pair recall 98.599%  (S2 98.739, S3 98.468)
+      oracle F0.5 ceiling 0.99571 | 11.2 candidates per S2/S3 record, 52.5 per S1 (median 37)
+      runtime: train 64 min, test 41 min  (was 6.76 h for the old 92.8%-recall Exact+Token)
+    Matcher v1 (single XGBoost): validation macro F0.5 0.97442 @ threshold 0.67
+      zero-match S1 0.97433 | single-match S1 0.92029 | multi-match S1 0.97766
+    LEADERBOARD (public): 0.965   (first submission, 27 Sep 14:04 IST)
+
+8.2 Diagnosis of v1
+    - The gap is in matching (0.974 vs ceiling 0.996), not retrieval.
+    - Only 7.8M training pairs vs 50M validation pairs: with val_frac 5%, 43% of all
+      queries touch a validation S1 (each has ~11 candidates) -> model trained on ~13% of data.
+    - Weak buckets: single-match S1 (0.920) and zero-match S1 (0.974). Their errors
+      need S1-level context a pair model cannot see.
+    - Threshold sweep took 28 min (full decide() per threshold).
+    - Leaderboard 0.965 < validation 0.974: test adds France (unseen) — country-agnostic
+      features transfer, but validation cannot measure France.
+    - Every rerun repeated retrieval (~1h45m) and nothing was persisted.
+
+8.3 Implemented in v2.1 (this update)
+    - features: computed ONCE for ALL candidate pairs into a float32 disk memmap
+      (<work>/<split>/X_all.f32), reused by training, OOF scoring and prediction.
+    - train: val_frac 0.02, train_query_frac 0.35 (~36M training pairs, ~5x more).
+      Stage 1 = 2 fold models (split by query); every train pair scored out-of-fold,
+      all other pairs scored by the fold-model mean.
+      Stage 2 = pair features + 10 group features (group.py: query best/second p,
+      margin, strongest other claimant of the S1, claim mass, confident claimants per
+      source) -> second XGBoost. Stage with the better validation F0.5 is used.
+    - fast threshold sweep (argmax once; ~seconds).
+    - persistence: `persist` copies candidates, models, meta, test scores to
+      OUT/artifacts (kept by Kaggle, downloaded by watch-kaggle.ps1); `restore` copies
+      them back from an attached previous notebook version -> retrieval (and optionally
+      training, SKIP_TRAIN) are skipped. `predict --threshold X` re-thresholds from saved
+      test probabilities without re-scoring.
+    - `package --team NAME` builds NAME_submission.zip in the exact required layout
+      (output/, code/business_entity_resolution/{src,README.md,requirements.txt},
+      Documentation_template.md). Nothing in the repo needs to be moved.
+
+8.4 Next steps (in order of expected gain per hour)
+    a. Run v2.1 with the previous version attached (restore) -> compare stage 1/2 val F0.5,
+       submit if better than 0.974 validation.
+    b. Expected-F0.5 set selection per S1 (Phase 4.2) using calibrated stage-2 p.
+    c. Retrieval recall 98.6% -> 99.3%+: raise k_comb 8->12 or add exact street-number +
+       street-token key channel; check misses by noise bucket (native-script, junk name).
+    d. String features between a query and the S1's other accepted members (group
+       string consistency) — helps junk / native-script names.
+    e. Fill Documentation_template.md with measured numbers; package final zip.
+
+    

@@ -170,33 +170,43 @@ def build_matrix(idx: np.ndarray, c: dict, ctx: dict, t: Tables, chunk: int = 1_
     return X
 
 
-def run(work_dir: Path, split: str, train_query_frac: float = 0.2, val_frac: float = 0.1, seed: int = 11) -> None:
-    if split != "train":
-        log("features for test are computed chunk-wise inside `predict`; nothing to do here")
-        return
+def open_matrix(wdir: Path, mode: str = "r") -> np.memmap:
+    """Feature matrix of ALL candidate pairs (row i = pair i of cands.npz), float32 memmap."""
+    shape = tuple(np.load(wdir / "X_all_shape.npy"))
+    return np.memmap(wdir / "X_all.f32", dtype=np.float32, mode=mode, shape=shape)
+
+
+def run(work_dir: Path, split: str, chunk: int = 2_000_000) -> None:
+    """
+    Compute features for EVERY candidate pair into <split>/X_all.f32 (disk memmap).
+    ~18-19 GB for ~115M pairs; on Kaggle keep --work on /tmp (large disk).
+    """
     wdir = split_work_dir(work_dir, split)
     params = load_pickle(wdir / "retrieval_params.pkl")
+    done = wdir / "X_all.done"
+    if done.is_file() and (wdir / "X_all.f32").is_file():
+        log(f"features for {split} already computed ({done.name}); skipping")
+        return
     with timer("load tables + candidates"):
         t = Tables(wdir)
         c = load_cands(wdir)
-        q_true = np.load(wdir / "q_true_s1.npy")
     with timer("competition context"):
         ctx = pair_context(c, t, params["w_name"])
-
-    rng = np.random.default_rng(seed)
-    val_s1 = rng.random(t.n_s1) < val_frac
-    touch_val = np.zeros(t.n_q, bool)
-    touch_val[c["q"][val_s1[c["s1"]]]] = True
-    touch_val[np.flatnonzero((q_true >= 0) & val_s1[np.maximum(q_true, 0)])] = True
-    take_q = touch_val | (rng.random(t.n_q) < train_query_frac)
-    idx = np.flatnonzero(take_q[c["q"]])
-    log(f"feature rows: {len(idx):,} pairs from {int(take_q.sum()):,} queries "
-        f"({int(touch_val.sum()):,} touch validation S1)")
-    with timer("string features"):
-        X = build_matrix(idx, c, ctx, t)
-    y = (q_true[c["q"][idx]] == c["s1"][idx]).astype(np.int8)
-    np.save(wdir / "X.npy", X)
-    np.savez(wdir / "pairs_meta.npz", idx=idx, q=c["q"][idx], s1=c["s1"][idx], y=y,
-             val_pair=val_s1[c["s1"][idx]], q_touch_val=touch_val[c["q"][idx]])
-    np.save(wdir / "val_s1.npy", val_s1)
-    log(f"saved X {X.shape}, positives {int(y.sum()):,}")
+    n = len(c["q"])
+    np.save(wdir / "X_all_shape.npy", np.array([n, len(FEATURE_NAMES)], dtype=np.int64))
+    X = open_matrix(wdir, mode="w+")
+    col = {name: i for i, name in enumerate(FEATURE_NAMES)}
+    with timer(f"features for all {n:,} {split} pairs"):
+        for start in range(0, n, chunk):
+            sel = np.arange(start, min(start + chunk, n))
+            sf = string_features(c["q"][sel], c["s1"][sel], t)
+            block = np.empty((len(sel), len(FEATURE_NAMES)), dtype=np.float32)
+            for name in FEATURE_NAMES:
+                block[:, col[name]] = sf[name] if name in sf else ctx[name][sel]
+            X[start:start + len(sel)] = block
+            if (start // chunk) % 5 == 0:
+                log(f"    features {start + len(sel):,}/{n:,}")
+    X.flush()
+    del X
+    done.write_text("ok")
+    log(f"saved {split}/X_all.f32 ({n:,} x {len(FEATURE_NAMES)})")

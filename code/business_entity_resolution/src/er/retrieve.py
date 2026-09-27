@@ -169,6 +169,14 @@ def run(work_dir: Path, split: str, k_name: int = 3, k_addr: int = 3, k_comb: in
     (wdir / "cand_parts").mkdir(exist_ok=True)
     workers = max(1, min((workers or env_threads()) - 1, 3))
     tag = f"k{k_name}-{k_addr}-{k_comb}_w{w_name}_d{dim}"
+    params = {"k_name": k_name, "k_addr": k_addr, "k_comb": k_comb, "w_name": w_name, "dim": dim}
+    if (wdir / "cands.npz").is_file() and (wdir / "retrieval_params.pkl").is_file():
+        if load_pickle(wdir / "retrieval_params.pkl") == params:
+            log(f"{split}/cands.npz already exists with the same parameters (restored or previous run); skipping retrieval")
+            if (wdir / "retrieval_report.pkl").is_file():
+                log("RETRIEVAL REPORT (saved):\n" + format_report(load_pickle(wdir / "retrieval_report.pkl")))
+            return
+        log("existing cands.npz has different parameters; recomputing")
 
     s1 = load_pickle(wdir / "s1.pkl")
     s1_country = s1["country"].to_numpy()
@@ -285,8 +293,7 @@ def run(work_dir: Path, split: str, k_name: int = 3, k_addr: int = 3, k_comb: in
                  "sn": np.concatenate(csn)[order], "sa": np.concatenate(csa)[order], **stats}
         del cq, cs, csn, csa
         np.savez(wdir / "cands.npz", **cands)
-    save_pickle({"k_name": k_name, "k_addr": k_addr, "k_comb": k_comb, "w_name": w_name, "dim": dim},
-                wdir / "retrieval_params.pkl")
+    save_pickle(params, wdir / "retrieval_params.pkl")
     log(f"saved {len(cands['q']):,} candidate pairs ({len(cands['q']) / max(n_q, 1):.2f} per query)")
 
     true_path = wdir / "q_true_s1.npy"
