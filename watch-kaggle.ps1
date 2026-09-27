@@ -4,10 +4,13 @@ $OutputDir = "C:\Users\fateh\AmazonMLChallenge\output"
 # candidate_pairs.zip (~620 MB) is needed for the final submission package.
 # artifacts/ (~4 GB: trained models, candidate sets, test scores) lets you reuse the run later.
 $DownloadCandidates = $true
-$DownloadArtifacts  = $true
+# "models" = trained models + meta + translit (~70 MB); "all" = also candidate sets/test scores (~4 GB);
+# "none". Re-using a run on Kaggle does NOT need a download (attach the notebook version as input).
+$DownloadArtifacts  = "models"
 $Pattern = "matching_results\.zip|matcher_meta\.json"
 if ($DownloadCandidates) { $Pattern += "|candidate_pairs\.zip" }
-if ($DownloadArtifacts)  { $Pattern += "|artifacts/" }
+if ($DownloadArtifacts -eq "all")    { $Pattern += "|artifacts/" }
+if ($DownloadArtifacts -eq "models") { $Pattern += "|artifacts/translit\.json|artifacts/train/.*\.json" }
 $env:PYTHONIOENCODING = "utf-8"   # the Kaggle CLI crashes printing non-ASCII log text on cp1252 consoles
 
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null

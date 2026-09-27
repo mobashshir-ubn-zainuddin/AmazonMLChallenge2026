@@ -55,11 +55,53 @@ def query_fold(q: np.ndarray, folds: int) -> np.ndarray:
 
 
 def decide(q: np.ndarray, s1: np.ndarray, p: np.ndarray, is_s3_q: np.ndarray, threshold: float) -> np.ndarray:
-    """Boolean mask of pairs kept as final matches."""
+    """Boolean mask of pairs kept as final matches (global threshold rule)."""
     if len(q) == 0:
         return np.zeros(0, bool)
     best, _ = best_mask(q, p)
-    keep = best & (p >= threshold)
+    return apply_caps(best & (p >= threshold), s1, q, p, is_s3_q)
+
+
+def decide_expected(q: np.ndarray, s1: np.ndarray, p: np.ndarray, is_s3_q: np.ndarray, pmin: float) -> np.ndarray:
+    """
+    Per-S1 expected-F0.5 set selection.
+
+    For each S1, take the records that chose it as their best S1 (p >= pmin), sorted by p.
+    Keep the prefix of size k maximizing  E[F0.5] ≈ 1.25*sum_{i<=k} p_i / (0.25*E[#true] + k),
+    with E[#true] = sum of p over all records that chose this S1; the empty set scores
+    P(no true match) ≈ prod(1 - p_i). Picks "no match" when that is the better bet.
+    """
+    if len(q) == 0:
+        return np.zeros(0, bool)
+    best, _ = best_mask(q, p)
+    bi = np.flatnonzero(best)
+    n_s1 = int(s1.max()) + 1
+    pc = np.clip(p, 0.0, 1.0 - 1e-6).astype(np.float64)
+    exp_true = np.bincount(s1[bi], weights=pc[bi], minlength=n_s1)
+    log_empty = np.bincount(s1[bi], weights=np.log1p(-pc[bi]), minlength=n_s1)
+    idx = bi[p[bi] >= pmin]
+    keep = np.zeros(len(q), bool)
+    if len(idx) == 0:
+        return keep
+    o = np.lexsort((-p[idx], s1[idx]))
+    ii = idx[o]
+    ss = s1[ii]
+    starts = np.flatnonzero(np.r_[True, ss[1:] != ss[:-1]])
+    grp = np.repeat(np.arange(len(starts)), np.diff(np.r_[starts, len(ii)]))
+    rank = np.arange(len(ii)) - starts[grp]
+    cs = np.cumsum(pc[ii])
+    cum = cs - np.r_[0.0, cs][starts][grp]
+    ef = 1.25 * cum / (0.25 * exp_true[ss] + rank + 1)
+    gmax = np.maximum.reduceat(ef, starts)
+    first_max = np.minimum.reduceat(np.where(ef >= gmax[grp] - 1e-12, rank, 1 << 30), starts)
+    empty_ef = np.exp(log_empty[ss[starts]])
+    kstar = np.where(gmax > empty_ef, first_max + 1, 0)
+    keep[ii[rank < kstar[grp]]] = True
+    return apply_caps(keep, s1, q, p, is_s3_q)
+
+
+def apply_caps(keep: np.ndarray, s1: np.ndarray, q: np.ndarray, p: np.ndarray, is_s3_q: np.ndarray) -> np.ndarray:
+    """Per S1 keep at most MAX_S2 S2 and MAX_S3 S3 records (highest p first)."""
     idx = np.flatnonzero(keep)
     src = is_s3_q[q[idx]].astype(np.int8)
     o = np.lexsort((-p[idx], src, s1[idx]))
@@ -72,8 +114,9 @@ def decide(q: np.ndarray, s1: np.ndarray, p: np.ndarray, is_s3_q: np.ndarray, th
     return keep
 
 
-def evaluate(q, s1, p, is_s3_q, q_true, n_s1, s1_mask, threshold) -> dict:
-    keep = decide(q, s1, p, is_s3_q, threshold)
+def evaluate(q, s1, p, is_s3_q, q_true, n_s1, s1_mask, threshold, keep=None) -> dict:
+    if keep is None:
+        keep = decide(q, s1, p, is_s3_q, threshold)
     f = per_s1_f05(n_s1, q_true, q[keep], s1[keep])[s1_mask]
     ntrue = np.bincount(q_true[q_true >= 0], minlength=n_s1)[s1_mask]
     return {
@@ -101,6 +144,17 @@ def sweep(q, s1, p, is_s3_q, q_true, n_s1, s1_mask) -> tuple[float, dict]:
         if f > top_f:
             top_t, top_f = float(t), float(f)
     return top_t, evaluate(q, s1, p, is_s3_q, q_true, n_s1, s1_mask, top_t)
+
+
+def sweep_expected(q, s1, p, is_s3_q, q_true, n_s1, s1_mask) -> tuple[float, dict]:
+    """Tune the p floor of the expected-F0.5 rule on validation."""
+    top_m, top = 0.3, None
+    for pmin in (0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7):
+        r = evaluate(q, s1, p, is_s3_q, q_true, n_s1, s1_mask, None,
+                     keep=decide_expected(q, s1, p, is_s3_q, pmin))
+        if top is None or r["f05"] > top["f05"]:
+            top_m, top = pmin, r
+    return top_m, top
 
 
 def predict_rows(bst: xgb.Booster, it: int, X: np.ndarray, rows=None, extra=None, chunk: int = 2_000_000) -> np.ndarray:
@@ -133,7 +187,11 @@ def run(work_dir: Path, rounds: int = 1500, train_query_frac: float = 0.35, val_
     cq, cs = c["q"], c["s1"]
     del c
     q_true = np.load(wdir / "q_true_s1.npy")
-    is_s3_q = load_pickle(wdir / "q.pkl")["is_s3"].to_numpy().astype(bool)
+    qt = load_pickle(wdir / "q.pkl")
+    is_s3_q = qt["is_s3"].to_numpy().astype(bool)
+    q_nk = qt["name_key"].to_numpy()
+    q_ad = qt["addr_clean"].to_numpy()
+    del qt
     n_q = len(q_true)
     n_s1 = len(load_pickle(wdir / "s1.pkl"))
     y = (q_true[cq] == cs).astype(np.int8)
@@ -157,7 +215,24 @@ def run(work_dir: Path, rounds: int = 1500, train_query_frac: float = 0.35, val_
     X_es = np.ascontiguousarray(X[es_rows])
     y_es = y[es_rows]
     models, iters = [], []
+    # Stage-1 models from a previous run (restored artifacts) are reused when they were
+    # trained with the same split settings (same seed -> identical folds/validation).
+    old = None
+    if (wdir / "matcher_meta.json").is_file():
+        from .common import load_json
+        m = load_json(wdir / "matcher_meta.json")
+        if (m.get("folds") == folds and m.get("val_frac") == val_frac and m.get("train_query_frac") == train_query_frac
+                and all((wdir / f"stage1_fold{k}.json").is_file() for k in range(folds))):
+            old = m
     for k in range(folds):
+        if old is not None:
+            bst = xgb.Booster()
+            bst.load_model(str(wdir / f"stage1_fold{k}.json"))
+            bst.set_param({"device": device})
+            models.append(bst)
+            iters.append(int(old["stage1_iterations"][k]))
+            log(f"stage-1 fold {k}: reusing saved model ({iters[-1]} trees)")
+            continue
         rows = tr_rows[fold_q[cq[tr_rows]] == k]
         with timer(f"stage-1 fold {k}: train on {len(rows):,} pairs"):
             Xk = np.ascontiguousarray(X[rows])
@@ -188,7 +263,7 @@ def run(work_dir: Path, rounds: int = 1500, train_query_frac: float = 0.35, val_
 
     # ---------------- stage 2: + group features ----------------
     with timer("group features over all train pairs"):
-        G = group_features(cq, cs, p1, is_s3_q, n_q, n_s1)
+        G = group_features(cq, cs, p1, is_s3_q, n_q, n_s1, q_nk, q_ad)
     names2 = FEATURE_NAMES + GROUP_FEATURES
     with timer(f"stage-2: train on {len(tr_rows):,} pairs"):
         X2 = np.hstack([np.asarray(X[tr_rows]), G[tr_rows]])
@@ -207,13 +282,27 @@ def run(work_dir: Path, rounds: int = 1500, train_query_frac: float = 0.35, val_
     use2 = r2["f05"] > r1["f05"]
     imp = bst2.get_score(importance_type="gain")
     log("stage-2 top features: " + ", ".join(f"{k}:{v:.0f}" for k, v in sorted(imp.items(), key=lambda kv: -kv[1])[:15]))
+
+    # decision rule: global threshold vs per-S1 expected-F0.5 selection
+    p_va = p2_va if use2 else p1[va_rows]
+    r_thr = r2 if use2 else r1
+    with timer("expected-F0.5 decision sweep"):
+        pmin, r_exp = sweep_expected(cq[va_rows], cs[va_rows], p_va, is_s3_q, q_true, n_s1, val_s1)
+    log(f"EXPECTED-F0.5 decision (pmin {pmin:.2f}): " + ", ".join(
+        f"{k}={v:.5f}" if isinstance(v, float) else f"{k}={v:,}" for k, v in r_exp.items()))
+    use_exp = r_exp["f05"] > r_thr["f05"]
+
     meta = {
         "folds": folds, "stage1_iterations": iters, "stage2_iteration": it2,
         "stage1": {"threshold": t1, "val": r1}, "stage2": {"threshold": t2, "val": r2},
+        "expected": {"pmin": pmin, "val": r_exp},
         "use_stage2": bool(use2), "threshold": t2 if use2 else t1,
+        "decision": "expected" if use_exp else "threshold", "pmin": pmin,
+        "val_f05": max(r_thr["f05"], r_exp["f05"]),
         "oracle_ceiling": orc, "device": device,
         "feature_names": FEATURE_NAMES, "group_features": GROUP_FEATURES,
         "val_frac": val_frac, "train_query_frac": train_query_frac,
     }
     save_json(meta, wdir / "matcher_meta.json")
-    log(f"USING STAGE {'2' if use2 else '1'} (val F0.5 {max(r1['f05'], r2['f05']):.5f}, threshold {meta['threshold']:.2f})")
+    log(f"USING STAGE {'2' if use2 else '1'} + {meta['decision']} decision "
+        f"(val F0.5 {meta['val_f05']:.5f}; threshold {meta['threshold']:.2f}, pmin {pmin:.2f})")
