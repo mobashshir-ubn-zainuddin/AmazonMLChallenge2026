@@ -21,7 +21,7 @@ import xgboost as xgb
 from .common import load_json, load_pickle, log, split_work_dir, timer, free
 from .features import load_cands, open_matrix
 from .group import group_features
-from .train import decide, pick_device, predict_rows
+from .train import decide, decide_expected, pick_device, predict_rows
 
 
 def write_grouped(path: Path, header: str, s1_ids: np.ndarray, pair_s1: np.ndarray, pair_q_ids: np.ndarray) -> None:
@@ -55,6 +55,8 @@ def run(work_dir: Path, out_dir: Path, threshold: float | None = None, write_can
     s1_ids = s1["entity_id"].to_numpy()
     q_ids = q["entity_id"].to_numpy()
     is_s3_q = q["is_s3"].to_numpy().astype(bool)
+    q_nk = q["name_key"].to_numpy()
+    q_ad = q["addr_clean"].to_numpy()
     del s1, q
     free()
     c = load_cands(wdir)
@@ -75,14 +77,20 @@ def run(work_dir: Path, out_dir: Path, threshold: float | None = None, write_can
         p = p1
         if meta["use_stage2"]:
             with timer("group features + stage-2 scoring"):
-                G = group_features(cq, cs, p1, is_s3_q, len(q_ids), len(s1_ids))
+                G = group_features(cq, cs, p1, is_s3_q, len(q_ids), len(s1_ids), q_nk, q_ad)
                 p = predict_rows(_load(tr_dir / "stage2.json"), meta["stage2_iteration"], X, extra=G)
                 del G
         np.savez(scores, p=p, p1=p1)
 
-    t = meta["threshold"] if threshold is None else threshold
-    keep = decide(cq, cs, p, is_s3_q, t)
-    log(f"stage {'2' if meta['use_stage2'] else '1'}, threshold {t:.2f}: {int(keep.sum()):,} matched pairs; "
+    method = meta.get("decision", "threshold") if threshold is None else "threshold"
+    if method == "expected":
+        keep = decide_expected(cq, cs, p, is_s3_q, meta["pmin"])
+        rule = f"expected-F0.5 (pmin {meta['pmin']:.2f})"
+    else:
+        t = meta["threshold"] if threshold is None else threshold
+        keep = decide(cq, cs, p, is_s3_q, t)
+        rule = f"threshold {t:.2f}"
+    log(f"stage {'2' if meta['use_stage2'] else '1'}, {rule}: {int(keep.sum()):,} matched pairs; "
         f"S1 with >=1 match: {len(np.unique(cs[keep])):,}/{len(s1_ids):,}")
 
     if write_candidates:

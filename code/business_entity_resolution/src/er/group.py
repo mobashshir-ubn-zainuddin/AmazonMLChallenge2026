@@ -15,10 +15,12 @@ All numpy group operations; ~100M pairs take about a minute.
 from __future__ import annotations
 
 import numpy as np
+from rapidfuzz import fuzz, process
 
 GROUP_FEATURES = [
     "p1", "g_is_best", "g_margin_q", "g_q_best", "g_q_second",
     "g_s1_max_other", "g_s1_sum_other", "g_s1_cnt_other", "g_s1_cnt_s2_other", "g_s1_cnt_s3_other",
+    "g_other_nk_ratio", "g_other_nk_tset", "g_other_ad_tset", "g_has_other",
 ]
 
 
@@ -33,7 +35,8 @@ def best_mask(q: np.ndarray, p: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def group_features(q: np.ndarray, s1: np.ndarray, p: np.ndarray, is_s3_q: np.ndarray,
-                   n_q: int, n_s1: int) -> np.ndarray:
+                   n_q: int, n_s1: int, q_nk: np.ndarray | None = None, q_ad: np.ndarray | None = None,
+                   chunk: int = 2_000_000) -> np.ndarray:
     """float32 matrix (n_pairs, len(GROUP_FEATURES))."""
     n = len(q)
     p = p.astype(np.float32)
@@ -75,10 +78,27 @@ def group_features(q: np.ndarray, s1: np.ndarray, p: np.ndarray, is_s3_q: np.nda
     ok = nx < len(bs)
     ok[ok] = bs[nx[ok]] == bs[starts[ok]]
     top2[bs[starts[ok]]] = bp[nx[ok]]
+    top2_pair = np.full(n_s1, -1, np.int64)
+    top2_pair[bs[starts[ok]]] = bi[o][nx[ok]]
     is_self_top = top1_pair[s1] == np.arange(n)
     max_other = np.where(is_self_top, top2[s1], top1[s1])
+    other_pair = np.where(is_self_top, top2_pair[s1], top1_pair[s1])
 
     out = np.empty((n, len(GROUP_FEATURES)), np.float32)
+    # string consistency with the strongest OTHER record claiming this S1
+    # (e.g. a junk-name record at the same address as the S1's other members)
+    out[:, 10:] = -1.0
+    has = other_pair >= 0
+    out[:, 13] = has
+    if q_nk is not None:
+        idx = np.flatnonzero(has)
+        oq = q[other_pair[idx]]
+        for a in range(0, len(idx), chunk):
+            sel, osel = idx[a:a + chunk], oq[a:a + chunk]
+            qs = q[sel]
+            out[sel, 10] = process.cpdist(q_nk[qs], q_nk[osel], scorer=fuzz.ratio, workers=-1, dtype=np.float32)
+            out[sel, 11] = process.cpdist(q_nk[qs], q_nk[osel], scorer=fuzz.token_set_ratio, workers=-1, dtype=np.float32)
+            out[sel, 12] = process.cpdist(q_ad[qs], q_ad[osel], scorer=fuzz.token_set_ratio, workers=-1, dtype=np.float32)
     out[:, 0] = p
     out[:, 1] = best
     out[:, 2] = margin_q

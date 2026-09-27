@@ -387,3 +387,37 @@ RETIRE from the main path: S1->S2/S3 token retrieval with a 200+200 cap, 12-rule
     e. Fill Documentation_template.md with measured numbers; package final zip.
 
     
+
+======================================================================
+9. STATUS UPDATE — 2026-09-27 evening (v2.1 run measured, v2.2 implemented)
+======================================================================
+9.1 v2.1 measured (full train):
+    Stage 1 (2 fold models, 32.3M train pairs): val macro F0.5 0.97600 @ 0.62
+    Stage 2 (+10 group features):               val macro F0.5 0.98114 @ 0.72   <- used
+      zero-match S1 0.97952 | single-match S1 0.91582 | multi-match S1 0.98520
+    Oracle ceiling on validation S1: 0.99563.
+    Loss budget (1 - F0.5 weighted by bucket share): multi-match ~0.0132, single ~0.0045,
+    zero ~0.0011; of the total ~0.019, ~0.0044 is retrieval misses.
+    Runtime: features 22 min/split, train 33 min, retrieval 60 min (train) / 37 min (test).
+
+9.2 SMOTE for France: NOT applicable. SMOTE oversamples labelled minority examples; the
+    training data contains no France labels, so there is nothing to oversample. All pair
+    features are country-agnostic similarities, so France is scored by the same rules.
+    (Pseudo-labelling France test pairs was considered but is too risky for the deadline.)
+
+9.3 v2.2 implemented (this update), all switched by validation, never worse than v2.1 rules:
+    - group string-consistency features: similarity (name ratio, name token-set, address
+      token-set) between a record and the strongest OTHER record claiming the same S1,
+      + has-other flag. Targets the multi-match bucket (largest loss share), e.g. junk-name
+      or native-script members sharing the address of the S1's other members.
+    - per-S1 expected-F0.5 decision rule (Phase 4.2) with a tuned p floor; chosen only if it
+      beats the global threshold on validation.
+    - stage-1 fold models are reused from restored artifacts (same seed/split settings),
+      saving ~15 min; stage 2 and the decision are retrained.
+    - watcher downloads only models by default (candidate artifacts stay on Kaggle and are
+      re-used by attaching the notebook version as an input).
+
+9.4 Remaining ideas after the deadline window (not attempted now)
+    - retrieval recall 98.6% -> 99%+ (k_comb 12, street-number exact channel)
+    - pseudo-labelled France fine-tuning; learned French address aliases
+    - stage-3 (second round of group features from stage-2 OOF probabilities)
