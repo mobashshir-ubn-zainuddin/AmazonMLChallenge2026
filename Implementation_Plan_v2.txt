@@ -421,3 +421,31 @@ RETIRE from the main path: S1->S2/S3 token retrieval with a 200+200 cap, 12-rule
     - retrieval recall 98.6% -> 99%+ (k_comb 12, street-number exact channel)
     - pseudo-labelled France fine-tuning; learned French address aliases
     - stage-3 (second round of group features from stage-2 OOF probabilities)
+
+======================================================================
+10. LEADERBOARD POST-MORTEM — 2026-09-27 ~20:45 IST
+======================================================================
+10.1 Observation: v2.1 raised validation F0.5 0.9744 -> 0.9811 but the public
+     leaderboard FELL 0.965 -> 0.960. Validation does not reflect test.
+10.2 Root cause (verified from record counts): the test set is built differently.
+       S2/S3 records per S1:  train 4.68  |  test 5.75  (every country: IN 5.82, US 5.76, FR 5.53)
+       US S1 index size:      train 1.32M |  test 0.66M
+       Our test predictions (~3.37 matches/S1) match train's 3.46, so the extra records are
+       DISTRACTORS: ~40% of test S2/S3 records have no true S1 vs 26% in train.
+     Consequences: (a) the prior P(record matches) is lower on test, so probabilities
+     calibrated on train are over-confident; (b) competition features (margin to the
+     2nd-best S1, #records claiming an S1, ranks) change scale with index/record density.
+     Stage 2 leans hardest on those (p1 + group margins/counts) -> biggest test drop.
+10.3 Fixes implemented (v2.3):
+     - predict --prior-test auto: prior-shift recalibration
+       logit(p) += logit(prior_test) - logit(prior_train), prior_test estimated as
+       train matches-per-S1 * n_S1 / n_records (0.601 on test vs 0.740 train, shift -0.64).
+     - predict --prob p1|p2: choose the stage from saved test probabilities (no re-scoring).
+     - train --drop density --no-stage2: stage-1 model without density-dependent features
+       (gap/margin/rank/count features), keeping absolute similarity + ordinal is_top/rank_q.
+     - saved test scores are tied to model_id so a retrained model never re-uses old scores.
+10.4 Submission plan for the remaining 3 submissions today:
+       #3 sub_p1_prior.tsv   (v2.1 stage-1 + prior correction; instant)
+       #4 sub_robust_prior.tsv (density-robust retrain + prior correction; ~80 min)
+       #5 best of the above with a different prior/threshold, or sub_p2_prior.tsv
+     SMOTE for France remains not applicable (no France labels exist).

@@ -52,10 +52,17 @@ def main() -> None:
     p.add_argument("--val-frac", type=float, default=0.02, help="fraction of S1 held out for validation")
     p.add_argument("--folds", type=int, default=2)
     p.add_argument("--rounds", type=int, default=1500)
+    p.add_argument("--drop", default="none", choices=["none", "density"],
+                   help="density = train without features whose scale depends on index/record density")
+    p.add_argument("--no-stage2", action="store_true", help="train/use stage 1 only")
     # predict
     p.add_argument("--threshold", type=float, default=None,
                    help="override the tuned threshold (re-uses saved test probabilities)")
     p.add_argument("--no-candidates", action="store_true", help="do not rewrite candidate_pairs.tsv")
+    p.add_argument("--prob", default="auto", choices=["auto", "p1", "p2"], help="which stage's probability to use")
+    p.add_argument("--prior-test", default=None,
+                   help="prior-shift correction: 'auto' or the expected share of matched S2/S3 records in test")
+    p.add_argument("--out-name", default="matching_results.tsv")
     a = p.parse_args()
 
     if a.stage == "sample":
@@ -89,11 +96,11 @@ def main() -> None:
 
     def train():
         from . import train as m
-        m.run(a.work, a.rounds, a.train_query_frac, a.val_frac, a.folds)
+        m.run(a.work, a.rounds, a.train_query_frac, a.val_frac, a.folds, drop=a.drop, no_stage2=a.no_stage2)
 
     def predict():
         from . import predict as m
-        m.run(a.work, a.out, a.threshold, not a.no_candidates)
+        m.run(a.work, a.out, a.threshold, not a.no_candidates, a.prob, a.prior_test, a.out_name)
 
     if a.stage == "prepare":
         prepare(a.split)

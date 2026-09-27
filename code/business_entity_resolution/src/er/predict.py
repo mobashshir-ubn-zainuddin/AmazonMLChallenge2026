@@ -45,7 +45,16 @@ def _load(path: Path) -> xgb.Booster:
     return bst
 
 
-def run(work_dir: Path, out_dir: Path, threshold: float | None = None, write_candidates: bool = True) -> None:
+def run(work_dir: Path, out_dir: Path, threshold: float | None = None, write_candidates: bool = True,
+        prob: str = "auto", prior_test: str | None = None, out_name: str = "matching_results.tsv") -> None:
+    """
+    prob:       auto (stage chosen on validation) | p1 (stage-1 fold mean) | p2 (stage-2)
+    prior_test: None | "auto" | a float. Prior-shift correction: the test set has more
+                distractor records than train (5.75 vs 4.68 S2/S3 records per S1), so the share
+                of records that truly match is lower. Probabilities are re-calibrated with
+                logit(p) += logit(prior_test) - logit(prior_train) before thresholding.
+                "auto" estimates prior_test = train matches-per-S1 * n_S1 / n_records.
+    """
     tr_dir = split_work_dir(work_dir, "train")
     wdir = split_work_dir(work_dir, "test")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -64,24 +73,54 @@ def run(work_dir: Path, out_dir: Path, threshold: float | None = None, write_can
     del c
 
     scores = wdir / "test_scores.npz"
-    if threshold is not None and scores.is_file():
-        p = np.load(scores)["p"]
+    reuse = scores.is_file() and (threshold is not None or prob != "auto" or prior_test is not None)
+    if reuse:
+        z = np.load(scores)
+        saved_id = str(z["model_id"]) if "model_id" in z.files else None
+        if saved_id != meta.get("model_id"):
+            log("saved test probabilities belong to a different model; re-scoring")
+            reuse = False
+    if reuse:
+        p1 = z["p1"]
+        p = z["p"]
         log(f"re-using saved test probabilities ({scores.name})")
     else:
         X = open_matrix(wdir)
         with timer(f"stage-1 scoring of {len(cq):,} test pairs ({meta['folds']} fold models)"):
             p1 = np.zeros(len(cq), np.float32)
+            cols = meta.get("kept_idx")
             for k, it in enumerate(meta["stage1_iterations"]):
-                p1 += predict_rows(_load(tr_dir / f"stage1_fold{k}.json"), it, X)
+                p1 += predict_rows(_load(tr_dir / f"stage1_fold{k}.json"), it, X, cols=cols)
             p1 /= meta["folds"]
         p = p1
-        if meta["use_stage2"]:
+        if meta["use_stage2"] and not meta.get("no_stage2"):
             with timer("group features + stage-2 scoring"):
                 G = group_features(cq, cs, p1, is_s3_q, len(q_ids), len(s1_ids), q_nk, q_ad)
-                p = predict_rows(_load(tr_dir / "stage2.json"), meta["stage2_iteration"], X, extra=G)
+                p = predict_rows(_load(tr_dir / "stage2.json"), meta["stage2_iteration"], X, extra=G, cols=cols)
                 del G
-        np.savez(scores, p=p, p1=p1)
+        np.savez(scores, p=p, p1=p1, model_id=str(meta.get("model_id")))
 
+    use2 = meta["use_stage2"] if prob == "auto" else prob == "p2"
+    pp = p if use2 else p1
+    stage_name = "2" if use2 else "1"
+    if threshold is None and prob != "auto":
+        threshold = meta["stage2" if use2 else "stage1"]["threshold"]
+    if prior_test is not None:
+        n_s1, n_q = len(s1_ids), len(q_ids)
+        prior_train = meta.get("train_prior", 7638365 / 10320219)
+        pt = (min(0.95, meta.get("train_matches_per_s1", 3.4613) * n_s1 / n_q)
+              if prior_test == "auto" else float(prior_test))
+        shift = float(np.log(pt / (1 - pt)) - np.log(prior_train / (1 - prior_train)))
+        pc = np.clip(pp.astype(np.float64), 1e-7, 1 - 1e-7)
+        pp = (1 / (1 + np.exp(-(np.log(pc / (1 - pc)) + shift)))).astype(np.float32)
+        log(f"prior-shift correction: train prior {prior_train:.3f} -> test prior {pt:.3f} (logit shift {shift:+.3f})")
+    best = np.zeros(len(pp), bool)
+    order = np.lexsort((-pp, cq))
+    first = np.r_[True, cq[order][1:] != cq[order][:-1]]
+    best[order[first]] = True
+    log(f"diagnostic: mean best-p per record {pp[best].mean():.3f}; records with best-p>=0.5: "
+        f"{(pp[best] >= 0.5).mean():.3f} (train matched share {meta.get('train_prior', 0.740):.3f})")
+    p = pp
     method = meta.get("decision", "threshold") if threshold is None else "threshold"
     if method == "expected":
         keep = decide_expected(cq, cs, p, is_s3_q, meta["pmin"])
@@ -90,7 +129,7 @@ def run(work_dir: Path, out_dir: Path, threshold: float | None = None, write_can
         t = meta["threshold"] if threshold is None else threshold
         keep = decide(cq, cs, p, is_s3_q, t)
         rule = f"threshold {t:.2f}"
-    log(f"stage {'2' if meta['use_stage2'] else '1'}, {rule}: {int(keep.sum()):,} matched pairs; "
+    log(f"stage {stage_name}, {rule}: {int(keep.sum()):,} matched pairs; "
         f"S1 with >=1 match: {len(np.unique(cs[keep])):,}/{len(s1_ids):,}")
 
     if write_candidates:
@@ -98,6 +137,6 @@ def run(work_dir: Path, out_dir: Path, threshold: float | None = None, write_can
             write_grouped(out_dir / "candidate_pairs.tsv", "source1_entity_id\tcandidate_entity_ids",
                           s1_ids, cs, q_ids[cq])
     with timer("write matching_results.tsv"):
-        write_grouped(out_dir / "matching_results.tsv", "source1_entity_id\tmatched_entity_ids",
+        write_grouped(out_dir / out_name, "source1_entity_id\tmatched_entity_ids",
                       s1_ids, cs[keep], q_ids[cq[keep]])
     log(f"outputs written to {out_dir}")

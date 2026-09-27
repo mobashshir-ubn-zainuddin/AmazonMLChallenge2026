@@ -34,6 +34,11 @@ from .group import GROUP_FEATURES, best_mask, group_features
 from .metrics import oracle_f05, per_s1_f05
 
 MAX_S2, MAX_S3 = 5, 6
+# Features whose SCALE depends on how dense the S1 index / record pool is. The test set has
+# ~23% more S2/S3 records per S1 and (for the US) an S1 index half the size of train, so
+# these features shift between train and test. `--drop density` trains without them.
+DENSITY_FEATURES = ["gap_best", "margin_other", "sn_gap", "sa_gap", "q_comb1", "q_comb2",
+                    "n_q", "rank_s1", "n_s1", "s1_top_s2", "s1_top_s3"]
 XGB_PARAMS = {
     "objective": "binary:logistic", "eval_metric": ["logloss", "aucpr"],
     "tree_method": "hist", "eta": 0.1, "max_depth": 9,
@@ -157,13 +162,17 @@ def sweep_expected(q, s1, p, is_s3_q, q_true, n_s1, s1_mask) -> tuple[float, dic
     return top_m, top
 
 
-def predict_rows(bst: xgb.Booster, it: int, X: np.ndarray, rows=None, extra=None, chunk: int = 2_000_000) -> np.ndarray:
-    """Predict for all rows (or selected sorted `rows`) of memmap X, optionally hstacking `extra`."""
+def predict_rows(bst: xgb.Booster, it: int, X: np.ndarray, rows=None, extra=None, chunk: int = 2_000_000,
+                 cols=None) -> np.ndarray:
+    """Predict for all rows (or selected sorted `rows`) of memmap X (optionally only feature
+    columns `cols`), optionally hstacking `extra`."""
     n = X.shape[0] if rows is None else len(rows)
     out = np.empty(n, np.float32)
     for a in range(0, n, chunk):
         b = min(a + chunk, n)
         blk = np.asarray(X[a:b] if rows is None else X[rows[a:b]])
+        if cols is not None:
+            blk = blk[:, cols]
         if extra is not None:
             blk = np.hstack([blk, extra[a:b] if rows is None else extra[rows[a:b]]])
         out[a:b] = bst.inplace_predict(np.ascontiguousarray(blk, dtype=np.float32), iteration_range=(0, it))
@@ -179,7 +188,7 @@ def fit(X_tr, y_tr, X_es, y_es, names, rounds, device) -> xgb.Booster:
 
 
 def run(work_dir: Path, rounds: int = 1500, train_query_frac: float = 0.35, val_frac: float = 0.02,
-        folds: int = 2, seed: int = 11) -> None:
+        folds: int = 2, seed: int = 11, drop: str = "none", no_stage2: bool = False) -> None:
     wdir = split_work_dir(work_dir, "train")
     device = pick_device()
     X = open_matrix(wdir)
@@ -212,7 +221,12 @@ def run(work_dir: Path, rounds: int = 1500, train_query_frac: float = 0.35, val_
     log(f"oracle F0.5 ceiling on validation S1: {orc:.5f}")
 
     # ---------------- stage 1: fold models ----------------
-    X_es = np.ascontiguousarray(X[es_rows])
+    dropped = set(DENSITY_FEATURES) if drop == "density" else set()
+    cols = [i for i, n in enumerate(FEATURE_NAMES) if n not in dropped] if dropped else None
+    names1 = [n for n in FEATURE_NAMES if n not in dropped]
+    sub = (lambda A: A[:, cols]) if cols is not None else (lambda A: A)
+    log(f"features: {len(names1)} used" + (f" (dropped density features: {sorted(dropped)})" if dropped else ""))
+    X_es = np.ascontiguousarray(sub(np.asarray(X[es_rows])))
     y_es = y[es_rows]
     models, iters = [], []
     # Stage-1 models from a previous run (restored artifacts) are reused when they were
@@ -222,7 +236,7 @@ def run(work_dir: Path, rounds: int = 1500, train_query_frac: float = 0.35, val_
         from .common import load_json
         m = load_json(wdir / "matcher_meta.json")
         if (m.get("folds") == folds and m.get("val_frac") == val_frac and m.get("train_query_frac") == train_query_frac
-                and all((wdir / f"stage1_fold{k}.json").is_file() for k in range(folds))):
+                and m.get("drop", "none") == drop and all((wdir / f"stage1_fold{k}.json").is_file() for k in range(folds))):
             old = m
     for k in range(folds):
         if old is not None:
@@ -235,8 +249,8 @@ def run(work_dir: Path, rounds: int = 1500, train_query_frac: float = 0.35, val_
             continue
         rows = tr_rows[fold_q[cq[tr_rows]] == k]
         with timer(f"stage-1 fold {k}: train on {len(rows):,} pairs"):
-            Xk = np.ascontiguousarray(X[rows])
-            bst = fit(Xk, y[rows], X_es, y_es, FEATURE_NAMES, rounds, device)
+            Xk = np.ascontiguousarray(sub(np.asarray(X[rows])))
+            bst = fit(Xk, y[rows], X_es, y_es, names1, rounds, device)
             del Xk
             free()
         bst.save_model(str(wdir / f"stage1_fold{k}.json"))
@@ -244,7 +258,7 @@ def run(work_dir: Path, rounds: int = 1500, train_query_frac: float = 0.35, val_
         iters.append(int(bst.best_iteration) + 1)
 
     with timer("stage-1 scoring of all train pairs"):
-        P = np.stack([predict_rows(m, it, X) for m, it in zip(models, iters)])
+        P = np.stack([predict_rows(m, it, X, cols=cols) for m, it in zip(models, iters)])
         p1 = P.mean(axis=0)
         in_tr = train_q[cq]
         fq = fold_q[cq]
@@ -262,11 +276,26 @@ def run(work_dir: Path, rounds: int = 1500, train_query_frac: float = 0.35, val_
                                                      for k, v in r1.items()))
 
     # ---------------- stage 2: + group features ----------------
+    if no_stage2:
+        bst2, it2, t2, r2, p2_va = None, 0, t1, {"f05": -1.0}, None
+    else:
+        bst2, it2, t2, r2, p2_va = _stage2(X, sub, cols, cq, cs, p1, is_s3_q, n_q, n_s1, q_nk, q_ad, tr_rows,
+                                           va_rows, es_rows, X_es, y, y_es, names1, rounds, device, wdir,
+                                           q_true, val_s1)
+    use2 = r2["f05"] > r1["f05"]
+    if bst2 is not None:
+        imp = bst2.get_score(importance_type="gain")
+        log("stage-2 top features: " + ", ".join(f"{k}:{v:.0f}" for k, v in sorted(imp.items(), key=lambda kv: -kv[1])[:15]))
+    _finish(locals())
+
+
+def _stage2(X, sub, cols, cq, cs, p1, is_s3_q, n_q, n_s1, q_nk, q_ad, tr_rows, va_rows, es_rows, X_es, y, y_es,
+            names1, rounds, device, wdir, q_true, val_s1):
     with timer("group features over all train pairs"):
         G = group_features(cq, cs, p1, is_s3_q, n_q, n_s1, q_nk, q_ad)
-    names2 = FEATURE_NAMES + GROUP_FEATURES
+    names2 = names1 + GROUP_FEATURES
     with timer(f"stage-2: train on {len(tr_rows):,} pairs"):
-        X2 = np.hstack([np.asarray(X[tr_rows]), G[tr_rows]])
+        X2 = np.hstack([sub(np.asarray(X[tr_rows])), G[tr_rows]])
         X2_es = np.hstack([X_es, G[es_rows]])
         bst2 = fit(X2, y[tr_rows], X2_es, y_es, names2, rounds, device)
         del X2, X2_es
@@ -274,14 +303,18 @@ def run(work_dir: Path, rounds: int = 1500, train_query_frac: float = 0.35, val_
     bst2.save_model(str(wdir / "stage2.json"))
     it2 = int(bst2.best_iteration) + 1
     with timer("stage-2 validation scoring"):
-        p2_va = predict_rows(bst2, it2, X, rows=va_rows, extra=G)
+        p2_va = predict_rows(bst2, it2, X, rows=va_rows, extra=G, cols=cols)
     t2, r2 = sweep(cq[va_rows], cs[va_rows], p2_va, is_s3_q, q_true, n_s1, val_s1)
     log(f"STAGE 2 validation @ {t2:.2f}: " + ", ".join(f"{k}={v:.5f}" if isinstance(v, float) else f"{k}={v:,}"
                                                      for k, v in r2.items()))
+    return bst2, it2, t2, r2, p2_va
 
-    use2 = r2["f05"] > r1["f05"]
-    imp = bst2.get_score(importance_type="gain")
-    log("stage-2 top features: " + ", ".join(f"{k}:{v:.0f}" for k, v in sorted(imp.items(), key=lambda kv: -kv[1])[:15]))
+
+def _finish(v: dict) -> None:
+    """Decision-rule selection + metadata (split out of run() for readability)."""
+    cq, cs, va_rows, is_s3_q, q_true, n_s1, val_s1 = (v[k] for k in
+        ("cq", "cs", "va_rows", "is_s3_q", "q_true", "n_s1", "val_s1"))
+    use2, p1, p2_va, r1, r2, t1, t2 = (v[k] for k in ("use2", "p1", "p2_va", "r1", "r2", "t1", "t2"))
 
     # decision rule: global threshold vs per-S1 expected-F0.5 selection
     p_va = p2_va if use2 else p1[va_rows]
@@ -289,20 +322,25 @@ def run(work_dir: Path, rounds: int = 1500, train_query_frac: float = 0.35, val_
     with timer("expected-F0.5 decision sweep"):
         pmin, r_exp = sweep_expected(cq[va_rows], cs[va_rows], p_va, is_s3_q, q_true, n_s1, val_s1)
     log(f"EXPECTED-F0.5 decision (pmin {pmin:.2f}): " + ", ".join(
-        f"{k}={v:.5f}" if isinstance(v, float) else f"{k}={v:,}" for k, v in r_exp.items()))
+        f"{kk}={vv:.5f}" if isinstance(vv, float) else f"{kk}={vv:,}" for kk, vv in r_exp.items()))
     use_exp = r_exp["f05"] > r_thr["f05"]
 
+    import time as _time
+    matched = q_true >= 0
     meta = {
-        "folds": folds, "stage1_iterations": iters, "stage2_iteration": it2,
+        "folds": v["folds"], "stage1_iterations": v["iters"], "stage2_iteration": v["it2"],
         "stage1": {"threshold": t1, "val": r1}, "stage2": {"threshold": t2, "val": r2},
         "expected": {"pmin": pmin, "val": r_exp},
         "use_stage2": bool(use2), "threshold": t2 if use2 else t1,
         "decision": "expected" if use_exp else "threshold", "pmin": pmin,
         "val_f05": max(r_thr["f05"], r_exp["f05"]),
-        "oracle_ceiling": orc, "device": device,
-        "feature_names": FEATURE_NAMES, "group_features": GROUP_FEATURES,
-        "val_frac": val_frac, "train_query_frac": train_query_frac,
+        "oracle_ceiling": v["orc"], "device": v["device"],
+        "feature_names": v["names1"], "group_features": GROUP_FEATURES,
+        "kept_idx": v["cols"], "drop": v["drop"], "no_stage2": bool(v["no_stage2"]),
+        "val_frac": v["val_frac"], "train_query_frac": v["train_query_frac"],
+        "train_prior": float(matched.mean()), "train_matches_per_s1": float(matched.sum() / n_s1),
+        "model_id": _time.strftime("%Y%m%d-%H%M%S"),
     }
-    save_json(meta, wdir / "matcher_meta.json")
+    save_json(meta, v["wdir"] / "matcher_meta.json")
     log(f"USING STAGE {'2' if use2 else '1'} + {meta['decision']} decision "
         f"(val F0.5 {meta['val_f05']:.5f}; threshold {meta['threshold']:.2f}, pmin {pmin:.2f})")
