@@ -112,6 +112,17 @@ dist/
 
 .cache/
 cache/
+<<<<<<< HEAD
 # Submission archives / local pipeline caches
 *_submission.zip
 work/
+=======
+
+# Microsoft Office temporary/lock files
+~$*.docx
+~$*.xlsx
+~$*.pptx
+~$*.xls
+~$*.doc
+~$*.ppt
+>>>>>>> origin/main
