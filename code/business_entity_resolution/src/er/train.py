@@ -1,10 +1,18 @@
 """
-Stage 4 — train the pair classifier and tune the decision rule for macro F0.5.
+Stage 4 — train the matcher (2 stages) and tune the decision rule for macro F0.5.
 
-Split: queries that touch a validation S1 (either as candidate or as true match)
-form the validation set; every other selected query is training data. So no
-query contributes to both, and validation S1 rows see their COMPLETE set of
-competing queries, which makes the validation F0.5 an honest estimate.
+Data split (by S1, honest for the per-S1 metric):
+  * validation S1 = random `val_frac` of S1; every query that has a validation S1
+    among its candidates (or as its true S1) is a validation query, so each
+    validation S1 sees its COMPLETE set of competing queries
+  * training queries = a random `train_query_frac` of the remaining queries
+
+Stage 1: pair classifier on the pair features, trained as K fold models (split by
+query). Every train pair is scored out-of-fold; every other pair (validation,
+unused, test) gets the mean of the fold models.
+Stage 2: pair features + group features (group.py) computed from the stage-1
+probabilities of ALL candidate pairs -> second classifier.
+The stage (1 or 2) with the better validation macro F0.5 is used for test.
 
 Decision rule (shared with predict.py):
   1. each query is assigned only to its highest-probability S1
@@ -20,11 +28,18 @@ from pathlib import Path
 import numpy as np
 import xgboost as xgb
 
-from .common import load_pickle, log, save_json, split_work_dir, timer
-from .features import FEATURE_NAMES
+from .common import load_pickle, log, save_json, split_work_dir, timer, free
+from .features import FEATURE_NAMES, load_cands, open_matrix
+from .group import GROUP_FEATURES, best_mask, group_features
 from .metrics import oracle_f05, per_s1_f05
 
 MAX_S2, MAX_S3 = 5, 6
+XGB_PARAMS = {
+    "objective": "binary:logistic", "eval_metric": ["logloss", "aucpr"],
+    "tree_method": "hist", "eta": 0.1, "max_depth": 9,
+    "min_child_weight": 5, "subsample": 0.8, "colsample_bytree": 0.8,
+    "lambda": 2.0, "max_bin": 256,
+}
 
 
 def pick_device() -> str:
@@ -35,28 +50,25 @@ def pick_device() -> str:
         return "cpu"
 
 
+def query_fold(q: np.ndarray, folds: int) -> np.ndarray:
+    return ((q.astype(np.uint64) * np.uint64(2654435761)) % np.uint64(2 ** 32) % np.uint64(folds)).astype(np.int8)
+
+
 def decide(q: np.ndarray, s1: np.ndarray, p: np.ndarray, is_s3_q: np.ndarray, threshold: float) -> np.ndarray:
     """Boolean mask of pairs kept as final matches."""
-    n = len(q)
-    if n == 0:
+    if len(q) == 0:
         return np.zeros(0, bool)
-    order = np.lexsort((-p, q))
-    first = np.ones(n, bool)
-    first[1:] = q[order][1:] != q[order][:-1]
-    best = np.zeros(n, bool)
-    best[order[first]] = True
+    best, _ = best_mask(q, p)
     keep = best & (p >= threshold)
-    # per-S1 caps by source
     idx = np.flatnonzero(keep)
     src = is_s3_q[q[idx]].astype(np.int8)
     o = np.lexsort((-p[idx], src, s1[idx]))
-    key = s1[idx][o] * 2 + src[o]
+    key = s1[idx][o].astype(np.int64) * 2 + src[o]
     starts = np.r_[0, np.flatnonzero(np.diff(key)) + 1]
     grp = np.repeat(np.arange(len(starts)), np.diff(np.r_[starts, len(key)]))
     rank = np.arange(len(key)) - starts[grp]
     cap = np.where(src[o] == 1, MAX_S3, MAX_S2)
-    drop = idx[o][rank >= cap]
-    keep[drop] = False
+    keep[idx[o][rank >= cap]] = False
     return keep
 
 
@@ -73,49 +85,135 @@ def evaluate(q, s1, p, is_s3_q, q_true, n_s1, s1_mask, threshold) -> dict:
     }
 
 
-def run(work_dir: Path, rounds: int = 1500) -> None:
+def sweep(q, s1, p, is_s3_q, q_true, n_s1, s1_mask) -> tuple[float, dict]:
+    """Fast threshold search (argmax computed once, caps applied only to the final pick)."""
+    best, _ = best_mask(q, p)
+    bq, bs, bp = q[best], s1[best], p[best]
+    correct = q_true[bq] == bs
+    ntrue = np.bincount(q_true[q_true >= 0], minlength=n_s1).astype(np.float64)
+    top_t, top_f = 0.5, -1.0
+    for t in np.r_[np.arange(0.05, 0.96, 0.05), np.arange(0.30, 0.90, 0.01)]:
+        m = bp >= t
+        npred = np.bincount(bs[m], minlength=n_s1)
+        tp = np.bincount(bs[m & correct], minlength=n_s1)
+        den = 0.25 * ntrue + npred
+        f = np.where(den > 0, 1.25 * tp / np.maximum(den, 1e-12), 1.0)[s1_mask].mean()
+        if f > top_f:
+            top_t, top_f = float(t), float(f)
+    return top_t, evaluate(q, s1, p, is_s3_q, q_true, n_s1, s1_mask, top_t)
+
+
+def predict_rows(bst: xgb.Booster, it: int, X: np.ndarray, rows=None, extra=None, chunk: int = 2_000_000) -> np.ndarray:
+    """Predict for all rows (or selected sorted `rows`) of memmap X, optionally hstacking `extra`."""
+    n = X.shape[0] if rows is None else len(rows)
+    out = np.empty(n, np.float32)
+    for a in range(0, n, chunk):
+        b = min(a + chunk, n)
+        blk = np.asarray(X[a:b] if rows is None else X[rows[a:b]])
+        if extra is not None:
+            blk = np.hstack([blk, extra[a:b] if rows is None else extra[rows[a:b]]])
+        out[a:b] = bst.inplace_predict(np.ascontiguousarray(blk, dtype=np.float32), iteration_range=(0, it))
+    return out
+
+
+def fit(X_tr, y_tr, X_es, y_es, names, rounds, device) -> xgb.Booster:
+    dtr = xgb.QuantileDMatrix(X_tr, label=y_tr, feature_names=names)
+    des = xgb.QuantileDMatrix(X_es, label=y_es, feature_names=names, ref=dtr)
+    bst = xgb.train({**XGB_PARAMS, "device": device}, dtr, num_boost_round=rounds,
+                    evals=[(dtr, "train"), (des, "val")], early_stopping_rounds=50, verbose_eval=100)
+    return bst
+
+
+def run(work_dir: Path, rounds: int = 1500, train_query_frac: float = 0.35, val_frac: float = 0.02,
+        folds: int = 2, seed: int = 11) -> None:
     wdir = split_work_dir(work_dir, "train")
-    X = np.load(wdir / "X.npy", mmap_mode="r")
-    m = np.load(wdir / "pairs_meta.npz")
-    q, s1, y = m["q"], m["s1"], m["y"]
-    va = m["q_touch_val"]
-    tr = ~va
-    q_true = np.load(wdir / "q_true_s1.npy")
-    val_s1 = np.load(wdir / "val_s1.npy")
-    is_s3_q = load_pickle(wdir / "q.pkl")["is_s3"].to_numpy()
-    n_s1 = len(val_s1)
-    log(f"train pairs {int(tr.sum()):,} (pos {int(y[tr].sum()):,}) | val pairs {int(va.sum()):,} (pos {int(y[va].sum()):,})")
-
     device = pick_device()
-    params = {
-        "objective": "binary:logistic", "eval_metric": ["logloss", "aucpr"],
-        "tree_method": "hist", "device": device, "eta": 0.08, "max_depth": 9,
-        "min_child_weight": 5, "subsample": 0.8, "colsample_bytree": 0.8,
-        "lambda": 2.0, "max_bin": 256,
+    X = open_matrix(wdir)
+    c = load_cands(wdir)
+    cq, cs = c["q"], c["s1"]
+    del c
+    q_true = np.load(wdir / "q_true_s1.npy")
+    is_s3_q = load_pickle(wdir / "q.pkl")["is_s3"].to_numpy().astype(bool)
+    n_q = len(q_true)
+    n_s1 = len(load_pickle(wdir / "s1.pkl"))
+    y = (q_true[cq] == cs).astype(np.int8)
+
+    rng = np.random.default_rng(seed)
+    val_s1 = rng.random(n_s1) < val_frac
+    touch_val = np.zeros(n_q, bool)
+    touch_val[cq[val_s1[cs]]] = True
+    touch_val[np.flatnonzero((q_true >= 0) & val_s1[np.maximum(q_true, 0)])] = True
+    train_q = ~touch_val & (rng.random(n_q) < train_query_frac)
+    fold_q = query_fold(np.arange(n_q), folds)
+    tr_rows = np.flatnonzero(train_q[cq])
+    va_rows = np.flatnonzero(touch_val[cq])
+    es_rows = np.sort(rng.choice(va_rows, size=min(3_000_000, len(va_rows)), replace=False))
+    log(f"S1 {n_s1:,} (val {int(val_s1.sum()):,}) | train pairs {len(tr_rows):,} (pos {int(y[tr_rows].sum()):,}) "
+        f"| val pairs {len(va_rows):,} | early-stop pairs {len(es_rows):,} | device {device}")
+    orc = float(oracle_f05(n_s1, q_true, cq[va_rows], cs[va_rows])[val_s1].mean())
+    log(f"oracle F0.5 ceiling on validation S1: {orc:.5f}")
+
+    # ---------------- stage 1: fold models ----------------
+    X_es = np.ascontiguousarray(X[es_rows])
+    y_es = y[es_rows]
+    models, iters = [], []
+    for k in range(folds):
+        rows = tr_rows[fold_q[cq[tr_rows]] == k]
+        with timer(f"stage-1 fold {k}: train on {len(rows):,} pairs"):
+            Xk = np.ascontiguousarray(X[rows])
+            bst = fit(Xk, y[rows], X_es, y_es, FEATURE_NAMES, rounds, device)
+            del Xk
+            free()
+        bst.save_model(str(wdir / f"stage1_fold{k}.json"))
+        models.append(bst)
+        iters.append(int(bst.best_iteration) + 1)
+
+    with timer("stage-1 scoring of all train pairs"):
+        P = np.stack([predict_rows(m, it, X) for m, it in zip(models, iters)])
+        p1 = P.mean(axis=0)
+        in_tr = train_q[cq]
+        fq = fold_q[cq]
+        if folds == 2:
+            p1[in_tr] = np.where(fq[in_tr] == 0, P[1][in_tr], P[0][in_tr])
+        else:
+            for k in range(folds):
+                m = in_tr & (fq == k)
+                p1[m] = np.delete(P, k, axis=0)[:, m].mean(axis=0)
+        del P
+        free()
+
+    t1, r1 = sweep(cq[va_rows], cs[va_rows], p1[va_rows], is_s3_q, q_true, n_s1, val_s1)
+    log(f"STAGE 1 validation @ {t1:.2f}: " + ", ".join(f"{k}={v:.5f}" if isinstance(v, float) else f"{k}={v:,}"
+                                                     for k, v in r1.items()))
+
+    # ---------------- stage 2: + group features ----------------
+    with timer("group features over all train pairs"):
+        G = group_features(cq, cs, p1, is_s3_q, n_q, n_s1)
+    names2 = FEATURE_NAMES + GROUP_FEATURES
+    with timer(f"stage-2: train on {len(tr_rows):,} pairs"):
+        X2 = np.hstack([np.asarray(X[tr_rows]), G[tr_rows]])
+        X2_es = np.hstack([X_es, G[es_rows]])
+        bst2 = fit(X2, y[tr_rows], X2_es, y_es, names2, rounds, device)
+        del X2, X2_es
+        free()
+    bst2.save_model(str(wdir / "stage2.json"))
+    it2 = int(bst2.best_iteration) + 1
+    with timer("stage-2 validation scoring"):
+        p2_va = predict_rows(bst2, it2, X, rows=va_rows, extra=G)
+    t2, r2 = sweep(cq[va_rows], cs[va_rows], p2_va, is_s3_q, q_true, n_s1, val_s1)
+    log(f"STAGE 2 validation @ {t2:.2f}: " + ", ".join(f"{k}={v:.5f}" if isinstance(v, float) else f"{k}={v:,}"
+                                                     for k, v in r2.items()))
+
+    use2 = r2["f05"] > r1["f05"]
+    imp = bst2.get_score(importance_type="gain")
+    log("stage-2 top features: " + ", ".join(f"{k}:{v:.0f}" for k, v in sorted(imp.items(), key=lambda kv: -kv[1])[:15]))
+    meta = {
+        "folds": folds, "stage1_iterations": iters, "stage2_iteration": it2,
+        "stage1": {"threshold": t1, "val": r1}, "stage2": {"threshold": t2, "val": r2},
+        "use_stage2": bool(use2), "threshold": t2 if use2 else t1,
+        "oracle_ceiling": orc, "device": device,
+        "feature_names": FEATURE_NAMES, "group_features": GROUP_FEATURES,
+        "val_frac": val_frac, "train_query_frac": train_query_frac,
     }
-    with timer(f"build DMatrix ({device})"):
-        dtr = xgb.QuantileDMatrix(np.ascontiguousarray(X[tr]), label=y[tr], feature_names=FEATURE_NAMES)
-        dva = xgb.QuantileDMatrix(np.ascontiguousarray(X[va]), label=y[va], feature_names=FEATURE_NAMES, ref=dtr)
-    with timer("train XGBoost"):
-        bst = xgb.train(params, dtr, num_boost_round=rounds, evals=[(dtr, "train"), (dva, "val")],
-                        early_stopping_rounds=60, verbose_eval=100)
-    bst.save_model(str(wdir / "matcher.json"))
-    del dtr
-
-    p = bst.predict(dva, iteration_range=(0, bst.best_iteration + 1))
-    qv, sv = q[va], s1[va]
-    orc = oracle_f05(n_s1, q_true, qv, sv)[val_s1].mean()
-    log(f"validation S1: {int(val_s1.sum()):,} | oracle F0.5 ceiling of candidates: {orc:.5f}")
-
-    best_t, best = 0.5, None
-    for t in np.r_[np.arange(0.05, 0.96, 0.05), np.arange(0.30, 0.80, 0.01)]:
-        r = evaluate(qv, sv, p, is_s3_q, q_true, n_s1, val_s1, float(t))
-        if best is None or r["f05"] > best["f05"]:
-            best_t, best = float(t), r
-    log(f"best threshold {best_t:.2f}: " + ", ".join(f"{k}={v:.5f}" if isinstance(v, float) else f"{k}={v:,}"
-                                                  for k, v in best.items()))
-    imp = bst.get_score(importance_type="gain")
-    top = sorted(imp.items(), key=lambda kv: -kv[1])[:15]
-    log("top features by gain: " + ", ".join(f"{k}:{v:.0f}" for k, v in top))
-    save_json({"threshold": best_t, "best_iteration": int(bst.best_iteration), "val": best,
-               "oracle_ceiling": float(orc), "device": device}, wdir / "matcher_meta.json")
+    save_json(meta, wdir / "matcher_meta.json")
+    log(f"USING STAGE {'2' if use2 else '1'} (val F0.5 {max(r1['f05'], r2['f05']):.5f}, threshold {meta['threshold']:.2f})")

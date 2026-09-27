@@ -46,7 +46,6 @@ htmlcov/
 *.tsv
 
 # Large dataset / generated-data directories
-dataset/
 processed/
 output/
 
@@ -113,6 +112,7 @@ dist/
 
 .cache/
 cache/
+<<<<<<< HEAD
 
 # Microsoft Office temporary/lock files
 ~$*.docx
@@ -121,3 +121,8 @@ cache/
 ~$*.xls
 ~$*.doc
 ~$*.ppt
+=======
+# Submission archives / local pipeline caches
+*_submission.zip
+work/
+>>>>>>> a3e153b (v2.1: all-pair feature memmap, 2-fold stage-1 + group-feature stage-2, persist/restore artifacts, packaging)
